@@ -934,7 +934,7 @@ static void G_GNUC_PRINTF(1, 2) seq_log(const char *fmt, ...)
     fputc('\n', g_seq_log);
 }
 
-static void blit_path_log(const char *path, const char *fmt, ...)
+static void G_GNUC_PRINTF(2, 3) blit_path_log(const char *path, const char *fmt, ...)
 {
     static FILE *f = NULL;
     if (!f) {
@@ -1168,7 +1168,7 @@ static bool gpu_vp_disabled(void)
     return off;
 }
 
-static void gpu_debug_log(const char *fmt, ...)
+static void G_GNUC_PRINTF(1, 2) gpu_debug_log(const char *fmt, ...)
 {
     /* Per-access debug log: opt-in (PPCGPU_DEBUG_LOG=1).  It writes and
      * flushes a line for every register access, which on its own costs a
@@ -5381,7 +5381,7 @@ static void ppc_mac_gpu_log_3d_draw(const PPCMacGPU3DState *st,
 
     /* Decode texture format */
     uint32_t txfmt_raw = st->pp_txformat_0 & 0x1F;
-    const char *txfmt_name = "?";
+    const char *txfmt_name;
     switch (txfmt_raw) {
     case 0x06: txfmt_name = "ARGB8888"; break;
     case 0x07: txfmt_name = "RGBA8888"; break;
@@ -7426,7 +7426,7 @@ static void ppc_mac_gpu_dispatch_3d_draw(PPCMacGPUState *s,
                               s->regs.regs_3d[R200_3D_IDX(R200_AOS_DESC_0)]);
                 for (uint32_t v = 0; v < cmd->num_vertices && v < 8; v++) {
                     const uint32_t *vd = gart_vb_data + v * stride_dw;
-                    float f[4];
+                    float f[4] = { 0 };
                     for (int k = 0; k < 4 && k < (int)stride_dw; k++) {
                         memcpy(&f[k], &vd[k], 4);
                     }
@@ -9387,7 +9387,7 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
          * bits [30:7] = various pipeline busy flags
          * ATI kext checks GUI_ACTIVE to wait for idle */
         val = 64; /* 64 free entries, GUI_ACTIVE=0 (idle) */
-        gpu_debug_log("STATUS_RD RBBM_STATUS -> 0x%08x (idle, %u free)", val, val & 0x7f);
+        gpu_debug_log("STATUS_RD RBBM_STATUS -> 0x%08x (idle, %u free)", (uint32_t)val, (uint32_t)val & 0x7f);
         {
             static int rbbm_read_count = 0;
             rbbm_read_count++;
@@ -9404,7 +9404,7 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
     /* GUI status - report idle */
     case R200_GUI_STAT:
         val = 64; /* Free FIFO entries */
-        gpu_debug_log("STATUS_RD GUI_STAT -> 0x%08x", val);
+        gpu_debug_log("STATUS_RD GUI_STAT -> 0x%08x", (uint32_t)val);
         break;
 
     /*
@@ -9631,7 +9631,7 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
          * bit 31 = CP_BUSY (1=processing commands)
          * bits [30:0] = various stage busy flags */
         val = 0;
-        gpu_debug_log("STATUS_RD CP_STAT -> 0x%08x (idle)", val);
+        gpu_debug_log("STATUS_RD CP_STAT -> 0x%08x (idle)", (uint32_t)val);
         break;
     case R200_CP_IB_BASE:
         val = s->regs.cp_ib_base;
@@ -9779,7 +9779,7 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
             }
         }
         gpu_debug_log("STATUS_RD SCRATCH_REG%d -> 0x%08x",
-                      scratch_idx, val);
+                      scratch_idx, (uint32_t)val);
         /*
          * Phase 3B: Log scratch register reads for QE gate analysis.
          * The guest polls scratch registers to check fence completion.
@@ -10399,7 +10399,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     case R200_CRTC_OFFSET:
         if (val != s->regs.crtc_offset) {
             blit_path_log("CRTC", "OFFSET changed 0x%x -> 0x%x",
-                          s->regs.crtc_offset, val);
+                          s->regs.crtc_offset, (uint32_t)val);
             r200_rate.flips++;             /* page flip: one frame */
             r200_perf_present();
         }
@@ -10409,14 +10409,14 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     case R200_CRTC_OFFSET_CNTL:
         if (val != s->regs.crtc_offset_cntl) {
             blit_path_log("CRTC", "OFFSET_CNTL changed 0x%x -> 0x%x",
-                          s->regs.crtc_offset_cntl, val);
+                          s->regs.crtc_offset_cntl, (uint32_t)val);
         }
         s->regs.crtc_offset_cntl = val;
         break;
     case R200_CRTC_PITCH:
         if (val != s->regs.crtc_pitch) {
             blit_path_log("CRTC", "PITCH changed 0x%x -> 0x%x",
-                          s->regs.crtc_pitch, val);
+                          s->regs.crtc_pitch, (uint32_t)val);
         }
         s->regs.crtc_pitch = val;
         s->display_invalid = true;
@@ -10634,7 +10634,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     /* CP - command processor */
     case R200_CP_RB_BASE:
         s->regs.cp_rb_base = val;
-        gpu_debug_log("CP_SETUP RB_BASE=0x%08x", val);
+        gpu_debug_log("CP_SETUP RB_BASE=0x%08x", (uint32_t)val);
         trace_ppc_mac_gpu_cp_ring_setup(val, s->regs.cp_rb_cntl);
         break;
     case R200_CP_RB_RPTR_ADDR:
@@ -10643,17 +10643,17 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         break;
     case R200_CP_RB_CNTL:
         s->regs.cp_rb_cntl = val;
-        gpu_debug_log("CP_SETUP RB_CNTL=0x%08x (log2size=%u)", val, val & 0x3f);
+        gpu_debug_log("CP_SETUP RB_CNTL=0x%08x (log2size=%u)", (uint32_t)val, (uint32_t)val & 0x3f);
         break;
     case R200_CP_RB_RPTR:
         s->regs.cp_rb_rptr = val;
         ppc_mac_gpu_rptr_writeback(s);
-        gpu_debug_log("CP_RING RPTR <- %u", val);
+        gpu_debug_log("CP_RING RPTR <- %u", (uint32_t)val);
         break;
     case R200_CP_RB_WPTR: {
         uint32_t old_rptr = s->regs.cp_rb_rptr;
         gpu_debug_log("CP_RING WPTR <- %u (prev=%u, delta=%d)",
-                      val, s->regs.cp_rb_wptr,
+                      (uint32_t)val, s->regs.cp_rb_wptr,
                       (int)val - (int)s->regs.cp_rb_wptr);
         s->regs.cp_rb_wptr = val;
 
@@ -10680,15 +10680,15 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     }
     case R200_CP_ME_CNTL:
         s->regs.cp_me_cntl = val;
-        gpu_debug_log("CP_SETUP ME_CNTL=0x%08x (ME_start=%d)", val, !(val & 0x10000000));
+        gpu_debug_log("CP_SETUP ME_CNTL=0x%08x (ME_start=%d)", (uint32_t)val, !((uint32_t)val & 0x10000000));
         break;
     case R200_CP_IB_BASE:
         s->regs.cp_ib_base = val;
-        gpu_debug_log("CP_IB BASE <- 0x%08x", val);
+        gpu_debug_log("CP_IB BASE <- 0x%08x", (uint32_t)val);
         break;
     case R200_CP_IB_BUFSZ:
         s->regs.cp_ib_bufsz = val;
-        gpu_debug_log("CP_IB BUFSZ <- %u dwords (KICK! base=0x%08x)", val, s->regs.cp_ib_base);
+        gpu_debug_log("CP_IB BUFSZ <- %u dwords (KICK! base=0x%08x)", (uint32_t)val, s->regs.cp_ib_base);
         /* Writing BUFSZ triggers IB execution */
         ppc_mac_gpu_execute_ib(s, s->regs.cp_ib_base, val);
         /*
@@ -10714,7 +10714,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     case R200_CP_CSQ_CNTL:
         /* Store value - kext polls until read-back matches */
         s->regs.cp_csq_cntl = val;
-        gpu_debug_log("CP_SETUP CSQ_CNTL=0x%08x (mode=%u)", val, (val >> 28) & 0xf);
+        gpu_debug_log("CP_SETUP CSQ_CNTL=0x%08x (mode=%u)", (uint32_t)val, ((uint32_t)val >> 28) & 0xf);
         break;
     case R200_SCRATCH_UMSK:
         s->regs.scratch_umsk = val;
@@ -10808,19 +10808,19 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     /* GART (AGP Intelligent Controller) registers */
     case R200_AIC_CTRL:           /* 0x01D0 */
         s->regs.aic_ctrl = val;
-        gpu_debug_log("GART AIC_CTRL=0x%x (enabled=%d)", val, val & 1);
+        gpu_debug_log("GART AIC_CTRL=0x%x (enabled=%d)", (uint32_t)val, (uint32_t)val & 1);
         break;
     case R200_AIC_PT_BASE:        /* 0x01D8 */
         s->regs.aic_pt_base = val;
-        gpu_debug_log("GART PT_BASE=0x%x", val);
+        gpu_debug_log("GART PT_BASE=0x%x", (uint32_t)val);
         break;
     case R200_AIC_LO_ADDR:        /* 0x01DC */
         s->regs.aic_lo_addr = val;
-        gpu_debug_log("GART LO_ADDR=0x%x", val);
+        gpu_debug_log("GART LO_ADDR=0x%x", (uint32_t)val);
         break;
     case R200_AIC_HI_ADDR:        /* 0x01E0 */
         s->regs.aic_hi_addr = val;
-        gpu_debug_log("GART HI_ADDR=0x%x", val);
+        gpu_debug_log("GART HI_ADDR=0x%x", (uint32_t)val);
         break;
 
     /* CRTC2 / misc stubs - accept writes silently */
@@ -10864,7 +10864,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
                 trace_ppc_mac_gpu_3d_reg_write(addr, val);
             }
             gpu_debug_log("3D_MMIO 0x%04x <- 0x%08x%s",
-                          (uint32_t)addr, val,
+                          (uint32_t)addr, (uint32_t)val,
                           addr == 0x1C3C ? " (RB3D_CNTL)" :
                           addr == 0x1C4C ? " (SE_CNTL)" : "");
         }
@@ -10899,7 +10899,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
                     case 0x20BC: name = "RE_STIPPLE_ADDR"; break;
                     }
                     gpu_debug_log("3D_MMIO 0x%04x <- 0x%08x (%s)",
-                                  (uint32_t)addr, val, name);
+                                  (uint32_t)addr, (uint32_t)val, name);
                 }
             }
             break;
@@ -10937,7 +10937,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
                     s->regs.crtc_offset = val * w * ((bpp + 7) / 8);
                     s->display_invalid = true;
                     gpu_debug_log("VBE Y_OFFSET=%u -> crtc_offset=0x%x",
-                                  val, s->regs.crtc_offset);
+                                  (uint32_t)val, s->regs.crtc_offset);
                 }
 
                 if (vbe_idx == VBE_DISPI_INDEX_ENABLE &&
