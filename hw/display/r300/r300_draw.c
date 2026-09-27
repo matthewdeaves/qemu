@@ -581,6 +581,19 @@ void r300_tex_layout(R300TexDesc *td, uint32_t bpp, bool dxt, bool pitch_en)
     td->size_bytes = off > UINT32_MAX ? UINT32_MAX : (uint32_t)off;
 }
 
+/* Undo aperture 0's dword reversal, then apply TX_OFFSET's swap.
+ * BC blocks are byte streams, including their endpoints and selectors;
+ * interpreting CPU-view bytes directly produces coloured speckle. */
+void r300_dxt_bytes(uint8_t *dst, const uint8_t *src, uint32_t n,
+                    bool host_data, uint32_t swap)
+{
+    static const uint8_t mode_xor[4] = { 0, 1, 3, 2 };
+    unsigned x = mode_xor[swap & 3] ^ (host_data ? 0 : 3);
+    for (uint32_t i = 0; i < n; i++) {
+        dst[i] = src[i ^ x];
+    }
+}
+
 static float un_bits(uint32_t v, unsigned sh, unsigned n)
 {
     return (float)((v >> sh) & ((1u << n) - 1)) / (float)((1u << n) - 1);
@@ -618,8 +631,8 @@ void r300_border_color(uint32_t fmt, uint32_t v, float c[4])
         c[3] = un_bits(v, 30, 2);
         break;
     case 0x0F: case 0x10: case 0x11:        /* DXT: B8G8R8A8 */
-        c[0] = un_bits(v, 16, 8); c[1] = un_bits(v, 8, 8);
-        c[2] = un_bits(v, 0, 8); c[3] = un_bits(v, 24, 8);
+        c[0] = un_bits(v, 0, 8); c[1] = un_bits(v, 8, 8);
+        c[2] = un_bits(v, 16, 8); c[3] = un_bits(v, 24, 8);
         break;
     case 0x12:                              /* signed formats: R8G8B8A8_SNORM */
         for (int i = 0; i < 4; i++) c[i] = sn_bits(v, 8 * i, 8);
@@ -677,9 +690,9 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
             /* VRAM holds the guest CPU's big-endian words (see r300_tex). */
             t->kind = R300_TEXK_RGBA8; bpp = 4; decode = (off & 3) == 0;
             break;
-        case 0xF:  t->kind = R300_TEXK_DXT1; bpp = 8;  dxt = true; break;   /* per block */
-        case 0x10: t->kind = R300_TEXK_DXT3; bpp = 16; dxt = true; break;
-        case 0x11: t->kind = R300_TEXK_DXT5; bpp = 16; dxt = true; break;
+        case 0xF:  t->kind = R300_TEXK_DXT1; bpp = 8;  dxt = true; decode = 3; break;   /* per block */
+        case 0x10: t->kind = R300_TEXK_DXT3; bpp = 16; dxt = true; decode = 3; break;
+        case 0x11: t->kind = R300_TEXK_DXT5; bpp = 16; dxt = true; decode = 3; break;
         default:
             bpp = r300_tex_raw_bpp(fmt);
             if (!bpp) {
@@ -692,6 +705,7 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
         }
         t->bound = true;
         t->gpu_addr = off & ~0x1Fu;
+        t->swap = off & 3;
         t->width = (f0 & 0x7FF) + 1;
         t->height = ((f0 >> 11) & 0x7FF) + 1;
         t->dim = (f1 >> 25) & 3;

@@ -45,7 +45,7 @@ enum {
     R300_TEXK_CONVERT16,        /* 16bpp packed: decoded to RGBA8 on the CPU */
     R300_TEXK_RAW,              /* uint view of the texel dwords, decoded by
                                    the shader (r300_tex_raw_bpp) */
-    R300_TEXK_DXT1,             /* compressed blocks, copied as they lie */
+    R300_TEXK_DXT1,             /* compressed blocks, normalized on upload */
     R300_TEXK_DXT3,
     R300_TEXK_DXT5,
 };
@@ -68,6 +68,7 @@ typedef struct R300TexDesc {
     uint32_t width, height;
     uint32_t pitch_bytes;       /* level 0: bytes per row (per row of blocks for DXT) */
     uint32_t format;            /* TX_FORMAT1 & 0x1F */
+    uint32_t swap;              /* TX_OFFSET endian mode */
     uint32_t kind;              /* R300_TEXK_* */
     uint32_t view_bpp;          /* RAW: bytes per uint-view element (4, 8, 16) */
     uint32_t filter0;           /* TX_FILTER0 */
@@ -119,6 +120,11 @@ void r300_tex_level_dims(const R300TexDesc *td, uint32_t l, uint32_t *w,
 /* Fill the layout fields of td from its size, format, dim and levels;
  * bpp is bytes per texel (per 4x4 block for DXT, flagged by dxt). */
 void r300_tex_layout(R300TexDesc *td, uint32_t bpp, bool dxt, bool pitch_en);
+
+/* Copy one DXT block row into Metal's byte order. n is a multiple of 4.
+ * VRAM is the CPU aperture view; GART data is the original byte stream. */
+void r300_dxt_bytes(uint8_t *dst, const uint8_t *src, uint32_t n,
+                    bool host_data, uint32_t swap);
 
 /* A TX_BORDER_COLOR dword as the unit's XYZW before the swizzle: packed
  * like a texel of the unit's format (8888 for texels wider than 32 bits;

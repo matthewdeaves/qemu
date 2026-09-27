@@ -242,6 +242,39 @@ int main(void)
         const float c1[4] = { 0.5f, 0.25f, 2.0f, 1.0f };
         const float red[4] = { 1, 0, 0, 1 };
 
+        /* BC1 endpoint 0 is red. Tiger TX_FORMAT1=0xAA0F selects
+         * Z,Y,X,1, so BC RGBA must become R300 BGRA before TX swizzle.
+         * Exercise the upload bytes and real generated Metal shader. */
+        {
+            R300State st;
+            program(&st, true);
+            r300_state_write(&st, 0x4E38, (7u << 21) | W);
+            r300_state_write(&st, 0x46A4, 21);
+            r300_state_write(&st, 0x4104, 1);
+            r300_state_write(&st, 0x44C0, 0xAA0F);
+            Target t = target(MTLPixelFormatRGBA32Uint, 16, 0);
+            char *m = msl_for(&st);
+            id<MTLRenderPipelineState> p = pipe_for(m, MTLPixelFormatRGBA32Uint);
+            free(m);
+            const uint8_t aperture[8] = { 0x07,0xe0,0xf8,0x00,0,0,0,0 };
+            uint8_t bc[8];
+            r300_dxt_bytes(bc, aperture, 8, false, 0);
+            MTLTextureDescriptor *d = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:MTLPixelFormatBC1_RGBA
+                width:4 height:4 mipmapped:NO];
+            id<MTLTexture> tx = [dev newTextureWithDescriptor:d];
+            [tx replaceRegion:MTLRegionMake2D(0,0,4,4) mipmapLevel:0 withBytes:bc bytesPerRow:8];
+            R300FSUniforms u = base_uniforms();
+            u.tex_info[0][0] = 1; u.tex_info[0][1] = 3;
+            u.tex_info[0][2] = u.tex_info[0][3] = 4;
+            u.tex_swz[0][0] = 2; u.tex_swz[0][2] = 0; u.tex_swz[0][3] = 5;
+            R300Vertex v[6]; quad(v, NULL, true);
+            draw(&t, p, &u, v, tx);
+            float o[4]; out4(&t, 1, 1, o);
+            CHECK(NEAR(o[0],1) && NEAR(o[1],0) && NEAR(o[2],0) && NEAR(o[3],1),
+                "BC1 red channel: %g %g %g %g", o[0],o[1],o[2],o[3]);
+        }
+
         /* ---- colour buffers ---- */
         /* ARGB16161616 / C4_16_FP, no swap: halves C0..C3 little-endian, unclamped */
         {

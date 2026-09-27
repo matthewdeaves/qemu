@@ -7296,7 +7296,7 @@ static uint64_t r300_hash(const uint8_t *p, size_t n)
 #define R300_TCACHE 256
 typedef struct R300TexCacheKey {
     uint32_t addr, format, kind, width, height, depth, dim, levels, pitch;
-    uint32_t host;
+    uint32_t host, swap;
 } R300TexCacheKey;
 static struct {
     R300TexCacheKey key;
@@ -7366,7 +7366,9 @@ static uint8_t *r300_level_bytes(const R300TexDesc *td, const uint8_t *src,
         *bpr = bw * bs;
         out = g_malloc((size_t)bw * bh * bs);
         for (uint32_t y = 0; y < bh; y++) {
-            memcpy(out + (size_t)y * bw * bs, src + (uint64_t)y * pitch, (size_t)bw * bs);
+            r300_dxt_bytes(out + (size_t)y * bw * bs,
+                           src + (uint64_t)y * pitch, bw * bs,
+                           td->host_data != NULL, td->swap);
         }
         return out;
     }
@@ -7415,7 +7417,7 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
 
     R300TexCacheKey key = { td->gpu_addr, td->format, td->kind, td->width, td->height,
                             td->depth, td->dim, td->levels, td->pitch_bytes,
-                            td->host_data != NULL };
+                            td->host_data != NULL, td->swap };
     /* A VRAM texture nothing has written since it was last checked is used
      * as it is; otherwise the texels are hashed and compared. */
     bool known = !td->host_data && td->write_gen;

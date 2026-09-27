@@ -132,7 +132,7 @@ static void rendering_completeness(void)
     r300_border_color(0x06, 0xF800, bc);
     CHECK(bc[0] == 0 && bc[1] == 0 && bc[2] == 1, "565 border %g %g %g", bc[0], bc[1], bc[2]);
     r300_border_color(0x0F, 0x00FF0000, bc);        /* DXT: B8G8R8A8 */
-    CHECK(bc[0] == 1 && bc[2] == 0, "dxt border %g %g", bc[0], bc[2]);
+    CHECK(bc[0] == 0 && bc[2] == 1, "dxt border %g %g", bc[0], bc[2]);
 
     /* ---- texture unit state: mip chain, LOD, 3D, cube, sign, gamma ---- */
     r300_state_write(&st, 0x4104, 1);
@@ -163,6 +163,12 @@ static void rendering_completeness(void)
     CHECK(p.tex[0].dim == R300_TEXDIM_CUBE && p.tex[0].size_bytes == 6 * 32 * 8,
           "cube unit %u", p.tex[0].size_bytes);
     r300_draw_free(&p);
+    for (unsigned fmt = 0x0F; fmt <= 0x11; fmt++) {
+        r300_state_write(&st, 0x44C0, fmt | 0xAA00);
+        r300_draw_build(&st, &none, 0x35, d, n, rd, NULL, &p, &err);
+        CHECK(p.uniforms.tex_info[0][1] == 3, "DXT BGRA decode %x", fmt);
+        r300_draw_free(&p);
+    }
     r300_state_write(&st, 0x4104, 0);
     r300_state_write(&st, 0x4440, 0);
 
@@ -491,6 +497,36 @@ int main(void)
         b.dim = R300_TEXDIM_3D;
         r300_tex_layout(&b, 16, false, false);
         CHECK(b.size_bytes == UINT32_MAX, "3D size wrapped to %u", b.size_bytes);
+    }
+
+    /* BC1 fixture: red/green endpoints with selectors 0,1,2,3.
+     * The DMA upload's CPU-aperture bytes are reversed per dword, not
+     * valid BC bytes. Verify VRAM and GART reach the same BC stream,
+     * including DXT3/5's extra eight alpha bytes. */
+    {
+        const uint8_t bc[16] = {
+            0x00, 0xf8, 0xe0, 0x07, 0xe4, 0xe4, 0xe4, 0xe4,
+            0xff, 0x00, 0x88, 0xc6, 0xfa, 0x88, 0xc6, 0xfa
+        };
+        const uint8_t aperture[16] = {
+            0x07, 0xe0, 0xf8, 0x00, 0xe4, 0xe4, 0xe4, 0xe4,
+            0xc6, 0x88, 0x00, 0xff, 0xfa, 0xc6, 0x88, 0xfa
+        };
+        uint8_t out[16];
+        for (unsigned n = 8; n <= 16; n += 8) {
+            r300_dxt_bytes(out, aperture, n, false, 0);
+            CHECK(!memcmp(out, bc, n), "DXT VRAM block %u bytes", n);
+            r300_dxt_bytes(out, bc, n, true, 0);
+            CHECK(!memcmp(out, bc, n), "DXT GART block %u bytes", n);
+            r300_dxt_bytes(out, bc, n, false, 2);
+            CHECK(!memcmp(out, bc, n), "DXT TX_OFFSET swap 2 %u bytes", n);
+        }
+        const uint8_t halfwords[4] = { 0xf8, 0x00, 0x07, 0xe0 };
+        const uint8_t words[4] = { 0xe0, 0x07, 0x00, 0xf8 };
+        r300_dxt_bytes(out, halfwords, 4, true, 1);
+        CHECK(!memcmp(out, bc, 4), "DXT 16-bit byte swap");
+        r300_dxt_bytes(out, words, 4, true, 3);
+        CHECK(!memcmp(out, bc, 4), "DXT 16-bit word swap");
     }
 
     rendering_completeness();
