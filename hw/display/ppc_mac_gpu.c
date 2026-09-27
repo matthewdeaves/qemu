@@ -3490,35 +3490,54 @@ static bool ppc_mac_gpu_agp_translate(PPCMacGPUState *s,
  * Returns a g_malloc'd buffer of ib_size_dw DWORDs (in CPU byte order),
  * or NULL if translation fails.  Caller must g_free.
  */
+/*
+ * Read n big-endian dwords of card address space (ring, indirect buffers)
+ * into dst in host order.  GART and AGP both map 4 KB pages, so each page
+ * is translated once and read in one go: per dword, the translations and
+ * flatview lookups were about 7% of the vCPU in Quake.
+ */
+static bool ppc_mac_gpu_read_dwords(PPCMacGPUState *s, uint32_t gpu_addr,
+                                    uint32_t *dst, uint32_t n)
+{
+    AddressSpace *as = pci_get_address_space(&s->pci);
+
+    while (n) {
+        uint32_t run = MIN(n, (0x1000 - (gpu_addr & 0xFFF)) / 4);
+        hwaddr phys;
+
+        if (!run) {
+            run = 1;                    /* a dword straddling a page */
+        }
+        if (!ppc_mac_gpu_gart_translate(s, gpu_addr, &phys) &&
+            !ppc_mac_gpu_agp_translate(s, gpu_addr, &phys)) {
+            gpu_debug_log("CP: GART translate failed at gpu_addr=0x%x", gpu_addr);
+            return false;
+        }
+        if (address_space_read(as, phys, MEMTXATTRS_UNSPECIFIED, dst,
+                               run * 4) != MEMTX_OK) {
+            gpu_debug_log("CP: read failed at phys=0x%"PRIx64, (uint64_t)phys);
+            return false;
+        }
+        for (uint32_t k = 0; k < run; k++) {
+            dst[k] = be32_to_cpu(dst[k]);
+        }
+        dst += run;
+        gpu_addr += run * 4;
+        n -= run;
+    }
+    return true;
+}
+
 static uint32_t *ppc_mac_gpu_read_ib_via_gart(PPCMacGPUState *s,
                                                 uint32_t ib_base,
                                                 uint32_t ib_size_dw)
 {
     uint32_t *buf = g_malloc(ib_size_dw * 4);
-    AddressSpace *as = pci_get_address_space(&s->pci);
 
-    for (uint32_t i = 0; i < ib_size_dw; i++) {
-        uint32_t gpu_addr = ib_base + i * 4;
-        hwaddr phys;
-
-        if (!ppc_mac_gpu_gart_translate(s, gpu_addr, &phys) &&
-            !ppc_mac_gpu_agp_translate(s, gpu_addr, &phys)) {
-            g_free(buf);
-            return NULL;
-        }
-
-        uint32_t raw = 0;
-        MemTxResult r = address_space_read(as, phys,
-                                            MEMTXATTRS_UNSPECIFIED, &raw, 4);
-        if (r != MEMTX_OK) {
-            g_free(buf);
-            return NULL;
-        }
-
-        /* Data in guest memory is big-endian (PPC native).
-         * PM4 commands are written in CPU byte order.
-         * Convert to host byte order for parsing. */
-        buf[i] = be32_to_cpu(raw);
+    /* PM4 is in guest memory in the CPU's (big-endian) byte order. */
+    if (!ppc_mac_gpu_read_dwords(s, ib_base, buf, ib_size_dw)) {
+        g_free(buf);
+        return NULL;
     }
     return buf;
 }
@@ -8828,33 +8847,18 @@ static void ppc_mac_gpu_process_ring_buffer(PPCMacGPUState *s,
      * The ring buffer base (CP_RB_BASE) is an AGP address that needs
      * GART translation to access system RAM. */
     uint32_t *rb_data = g_malloc(count * 4);
-    AddressSpace *as = pci_get_address_space(&s->pci);
 
-    for (uint32_t i = 0; i < count; i++) {
+    /* In runs up to the ring's end, where it wraps to its base. */
+    for (uint32_t i = 0; i < count; ) {
         uint32_t offset_dw = (old_rptr + i) & ring_mask;
-        uint32_t gpu_addr = s->regs.cp_rb_base + offset_dw * 4;
-        hwaddr phys;
+        uint32_t run = MIN(count - i, ring_mask + 1 - offset_dw);
 
-        if (!ppc_mac_gpu_gart_translate(s, gpu_addr, &phys) &&
-            !ppc_mac_gpu_agp_translate(s, gpu_addr, &phys)) {
-            gpu_debug_log("RING: GART translate failed at gpu_addr=0x%x "
-                          "(rb_base=0x%x offset_dw=%u)",
-                          gpu_addr, s->regs.cp_rb_base, offset_dw);
+        if (!ppc_mac_gpu_read_dwords(s, s->regs.cp_rb_base + offset_dw * 4,
+                                     rb_data + i, run)) {
             g_free(rb_data);
             return;
         }
-
-        uint32_t raw = 0;
-        MemTxResult r = address_space_read(as, phys,
-                                            MEMTXATTRS_UNSPECIFIED, &raw, 4);
-        if (r != MEMTX_OK) {
-            gpu_debug_log("RING: read failed at phys=0x%"PRIx64, (uint64_t)phys);
-            g_free(rb_data);
-            return;
-        }
-
-        /* Ring buffer data is written by PPC CPU in big-endian */
-        rb_data[i] = be32_to_cpu(raw);
+        i += run;
     }
 
     gpu_debug_log("RING: processing %u dwords (rptr=%u wptr=%u rb_bufsz=%u)",
