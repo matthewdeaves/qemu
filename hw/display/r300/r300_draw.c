@@ -1342,8 +1342,10 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
         /* User clip planes (VAP_CLIP_CNTL.UCP_ENA_n): the distance of the
          * clip-space position from plane n in PVS memory 1024 + n. */
         for (int k = 0; k < 6; k++) {
-            const float *pl = (const float *)&st->pvs_mem[(R300_PVS_UCP_START + k) * 4];
             const float *cp = out[lay.pos];
+            float pl[4];
+
+            memcpy(pl, &st->pvs_mem[(R300_PVS_UCP_START + k) * 4], sizeof(pl));
             xv[j].ucp[k] = (clip >> k) & 1 ? cp[0] * pl[0] + cp[1] * pl[1] +
                                              cp[2] * pl[2] + cp[3] * pl[3] : 1.0f;
         }

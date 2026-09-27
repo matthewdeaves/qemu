@@ -155,7 +155,7 @@ static void us_rgb_sel(char *buf, size_t len, unsigned sel)
     static const char *comp[] = { "rgb", "rrr", "ggg", "bbb" };
 
     if (sel < 12) {
-        snprintf(buf, len, "cs%u.%s", sel / 4 == 0 ? 0 : sel / 4 == 1 ? 1 : 2,
+        snprintf(buf, len, "cs%d.%s", sel / 4 == 0 ? 0 : sel / 4 == 1 ? 1 : 2,
                  comp[sel % 4]);
     } else if (sel < 15) {
         snprintf(buf, len, "float3(as%u.a)", sel - 12);
