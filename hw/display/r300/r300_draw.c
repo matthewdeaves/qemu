@@ -1292,13 +1292,24 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
     bool rects = prim == 8;
     uint32_t nsrc = rects ? n / 3 * 4 : n;
 
-    /* Transform every vertex in draw order (cheap next to the GPU work). */
+    /* Transform every vertex in draw order (cheap next to the GPU work).
+     * An indexed draw names most vertices more than once; the fetch and
+     * the vertex program depend only on the index, so a repeat copies
+     * the earlier result (slot + 1, 0 for none). */
     R300Vertex *xv = calloc(nsrc ? nsrc : 1, sizeof(R300Vertex));
     float (*outs)[R300_PVS_NUM_OUTPUTS][4] = calloc(nsrc ? nsrc : 1, sizeof(*outs));
+    uint32_t seen_idx[64], seen_slot[64] = { 0 };
     for (uint32_t i = 0, j = 0; i < n && j < nsrc; i++, j++) {
         float in[R300_PVS_NUM_INPUTS][4];
         float (*out)[4] = outs[j];
+        unsigned h = (order[i] * 0x9E3779B1u) >> 26;
 
+        if (!rects && seen_slot[h] && seen_idx[h] == order[i]) {
+            memcpy(out, outs[seen_slot[h] - 1], sizeof(outs[j]));
+            continue;
+        }
+        seen_idx[h] = order[i];
+        seen_slot[h] = j + 1;
         if (!fetch_vertex(&f, order[i], in)) {
             *err = f.why ? f.why : "vertex data out of range";
             free(outs);
