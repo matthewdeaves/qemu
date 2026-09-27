@@ -509,7 +509,22 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
         [[self window] setContentSize:[self fixAspectRatio:[self screenSafeAreaSize]]];
         [[self window] center];
     } else {
-        [[self window] setContentSize:[self fixAspectRatio:[self frame].size]];
+        /*
+         * A new guest mode gets one guest pixel per point, the size it would
+         * have on a non-Retina display, shrunk to fit the visible screen.
+         * Keeping the current frame left a 1024x768 guest in the initial
+         * 640x480-point window. The user's own resizes stand until the guest
+         * changes mode again.
+         */
+        NSWindow *win = [self window];
+        NSSize want = NSMakeSize(screen.width, screen.height);
+        NSSize room = [win contentRectForFrameRect:[[win screen] visibleFrame]].size;
+
+        if (want.width > room.width || want.height > room.height) {
+            want = [self fixAspectRatio:room];
+        }
+        [win setContentSize:want];
+        [win center];
     }
 }
 
