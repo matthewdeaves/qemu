@@ -1328,12 +1328,22 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
      * malloc, not calloc: xv.aux[1..3] and xv.ucp[6..7] are never written
      * (aux.x is the only meaningful component; real R300 hardware has only
      * 6 user clip planes, so the copy loop into the vertex-shader output
-     * never reaches index 6/7 either) and outs[j]'s PVS-program case only
-     * writes the outputs the route registers actually read back, by the
-     * same driver construction real hardware relies on. Verified by
-     * poison-filling both allocations (0xAA, not zero) and running the
-     * full offline suite (tests/r300/run.sh, Metal-backed rendering
-     * included) clean -- qemu#4.
+     * never reaches index 6/7 either), by the same driver construction real
+     * hardware relies on.
+     *
+     * outs[j] is different: qemu#16 found that "the route registers only
+     * read back what they need" does NOT mean the executed PVS program
+     * wrote it -- output_layout() assigns a slot to every enabled colour
+     * and texcoord register regardless of what any particular program
+     * writes, so a route configuration a test never exercised (a shifted
+     * texcoord slot from an extra colour or point size, a program that
+     * writes fewer components than its declared output count) reads
+     * malloc's garbage instead of calloc's old zero. Rather than revert to
+     * calloc for the whole 32-output buffer, read_slot below is exactly
+     * output_layout()'s own idea of what gets read (position, point size,
+     * enabled colours, enabled texcoords -- the only fields b->outs[i][*]
+     * is ever indexed by, see vtx_colors()/rs_values()/the point-size read
+     * at line ~1047), zeroed per vertex before its slot is written.
      */
     uint32_t xv_n = nsrc ? nsrc : 1;
     R300Vertex *xv = malloc(xv_n * sizeof(R300Vertex));
@@ -1344,6 +1354,22 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
         free(xv);
         free(order);
         return false;
+    }
+    uint8_t read_slot[1 + 1 + 4 + 8];
+    unsigned nread_slot = 0;
+    read_slot[nread_slot++] = (uint8_t)lay.pos;
+    if (lay.psize >= 0) {
+        read_slot[nread_slot++] = (uint8_t)lay.psize;
+    }
+    for (int c = 0; c < 4; c++) {
+        if (lay.color[c] >= 0) {
+            read_slot[nread_slot++] = (uint8_t)lay.color[c];
+        }
+    }
+    for (int t = 0; t < 8; t++) {
+        if (lay.tex_n[t]) {
+            read_slot[nread_slot++] = (uint8_t)lay.tex_slot[t];
+        }
     }
     uint32_t seen_idx[64], seen_slot[64] = { 0 };
     for (uint32_t i = 0, j = 0; i < n && j < nsrc; i++, j++) {
@@ -1364,6 +1390,9 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
             free(order);
             return false;
         }
+        for (unsigned s = 0; s < nread_slot; s++) {
+            memset(out[read_slot[s]], 0, sizeof(out[0]));
+        }
         if (bypass) {
             memcpy(out, in, sizeof(outs[j]));
         } else {
@@ -1377,7 +1406,12 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
         }
         if (rects && i % 3 == 2) {
             j++;
-            for (int o = 0; o < R300_PVS_NUM_OUTPUTS; o++) {
+            /* Only read_slot is ever read back for the synthesized 4th
+             * vertex too (same b->outs[i][*] consumers) -- completing all
+             * 32 outputs read garbage out of the rest on every rectangle
+             * draw for no purpose (qemu#16). */
+            for (unsigned s = 0; s < nread_slot; s++) {
+                int o = read_slot[s];
                 for (int c = 0; c < 4; c++) {
                     outs[j][o][c] = outs[j - 3][o][c] + outs[j - 1][o][c] - outs[j - 2][o][c];
                 }

@@ -2,6 +2,14 @@
 # Build and run the offline R300 tests: ./run.sh [builddir]
 set -e
 cd "$(dirname "$0")"
+# qemu#16: draw_core()'s per-draw scratch arrays are malloc'd, not calloc'd
+# (72bfdb7199) -- a genuine but easy-to-miss uninitialized read regresses
+# silently on a freshly-mapped page, which is usually already zero. macOS's
+# libSystem malloc will actually fill every new allocation with 0xAA before
+# handing it back when asked, so any output component draw_core() reads but
+# never writes turns into a byte pattern no float comparison mistakes for a
+# real value -- the same check the fix in r300_draw.c was verified against.
+export MallocPreScribble=1
 B=${1:-${TMPDIR:-/tmp}/r300-tests}
 mkdir -p "$B"
 R=../../hw/display/r300
