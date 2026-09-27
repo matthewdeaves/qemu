@@ -696,6 +696,11 @@ struct PPCMacGPUState {
 
     /* Device state */
     uint8_t mode;               /* VGA or extended mode */
+    /* Bumped by ppc_mac_gpu_reset() under the BQL.  A BQL-dropping wait
+     * (r200_scratch_read_wait) reads this before and after to notice a
+     * reset landed while it was unlocked, since reset's memset(&regs)
+     * invalidates whatever it was about to act on. */
+    uint32_t reset_gen;
     PPCMacGPURegs regs;         /* Register file */
     /* How big that register file is, saved with the machine so a state
      * written by another build cannot be poured into a different layout. */

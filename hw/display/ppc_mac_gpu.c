@@ -2137,12 +2137,29 @@ static bool r200_scratch_read_wait(PPCMacGPUState *s, int idx)
         }
     }
     if (pending) {
+        uint32_t gen = s->reset_gen;
         int64_t deadline = g_get_monotonic_time() + 100000;
         while ((int32_t)(qatomic_read(&s->regs.r200_fence_done) - want) < 0) {
             if (g_get_monotonic_time() >= deadline) {
                 return false;                /* something is stuck: flush */
             }
+            /*
+             * This is an MMIO read, always called with the BQL held.
+             * Sleeping up to 100 ms here while holding it stalls every
+             * other vCPU, timer and IO in the guest for the same
+             * stretch, so drop it for the sleep. A guest reset can then
+             * land in the gap and memset() the fence queue this loop
+             * read want/idx from; reset_gen (bumped under the BQL in
+             * ppc_mac_gpu_reset) says so once it is held again, and the
+             * stale wait is abandoned rather than draining regs a reset
+             * already zeroed.
+             */
+            bql_unlock();
             g_usleep(20);
+            bql_lock();
+            if (s->reset_gen != gen) {
+                return true;    /* reset already cleared what this was for */
+            }
         }
         r200_fence_drain(s, qatomic_read(&s->regs.r200_fence_done));
     }
@@ -11526,6 +11543,7 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
 {
     PPCMacGPUState *s = PPC_MAC_GPU(dev);
 
+    s->reset_gen++;
     memset(&s->regs, 0, sizeof(s->regs));
     s->hwc_w = s->hwc_h = s->hwc_idx = 0;
     s->regs.regs_3d[R200_3D_IDX(0x3230)] = 0xFFFFFFFFu;  /* DEPTHCLEARVALUE */
