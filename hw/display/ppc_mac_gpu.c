@@ -24,6 +24,8 @@
 #include "qemu/osdep.h"
 #include "r300/r300_state.h"
 #include "r300/r300_draw.h"
+#include "r300/r300_upload.h"
+#include "r300/r300_clear.h"
 #include "ui/poweremu-harmony.h"
 #include <math.h>
 #include <sched.h>
@@ -2412,7 +2414,7 @@ static uint32_t r300_zb_samples(PPCMacGPUState *s, uint32_t gpu_off)
 /*
  * 3D_CLEAR_ZMASK (0x32) marks every Z tile as holding ZB_DEPTHCLEARVALUE.
  * Depth is kept uncompressed in memory here, so write the clear value
- * over the buffer (the extent seen at earlier draws, else the scissor),
+ * over the buffer extent described by the current clear scissor,
  * every sample of it.
  */
 static void r300_zmask_clear(PPCMacGPUState *s)
@@ -2421,37 +2423,34 @@ static void r300_zmask_clear(PPCMacGPUState *s)
     uint32_t off = r300_reg(s->r3, 0x4F20) & ~0x1Fu;
     uint32_t pitch = r300_reg(s->r3, 0x4F24);
     uint32_t bpp = (r300_reg(s->r3, 0x4F10) & 0xF) == 2 ? 4 : 2;
-    uint32_t rows = ((r300_reg(s->r3, 0x43E4) >> 13) & 0x1FFF);
+    uint32_t scissor_br = r300_reg(s->r3, 0x43E4);
     uint32_t v = r300_swap_mode(r300_reg(s->r3, 0x4F28), (pitch >> 19) & 3);
     uint64_t bpr = (uint64_t)(pitch & 0x3FFC) * bpp;
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
 
-    rows = rows > 1440 ? rows - 1440 + 1 : 0;
-    if (s->r3_zb_offset == off && s->r3_zb_height > rows) {
-        rows = s->r3_zb_height;
+    if (off < fb_base) {
+        return;
     }
-    rows *= r300_zb_samples(s, off);
-    if (off < fb_base || !bpr || !rows) {
+    /* Never enlarge the clear to a historical draw's guard row. Q3's
+     * 769-row draw bound does not make its 768-row Z allocation larger. */
+    uint64_t bytes = r300_clear_bytes(scissor_br, bpr,
+        r300_zb_samples(s, off), off - fb_base, s->vram_size);
+    if (!bytes) {
         return;
     }
     off -= fb_base;
-    if (off >= s->vram_size) {
-        return;         /* else the clamp below underflows into a huge write */
-    }
-    if (off + bpr * rows > s->vram_size) {
-        rows = (s->vram_size - off) / bpr;
-    }
+    uint32_t rows = bytes / bpr;
     if (s->renderer && s->renderer->flush_r200) {
         s->renderer->flush_r200(s->renderer_opaque);
     }
-    for (uint64_t i = 0; i < bpr * rows; i += bpp) {
+    for (uint64_t i = 0; i < bytes; i += bpp) {
         if (bpp == 4) {
             stl_le_p(vram + off + i, v);
         } else {
             stw_le_p(vram + off + i, v);
         }
     }
-    memory_region_set_dirty(&s->vram, off, bpr * rows);
+    memory_region_set_dirty(&s->vram, off, bytes);
     static int logged;
     if (logged++ < 4) {
         qemu_log("ppc-mac-gpu r300: 3D_CLEAR_ZMASK: depth at 0x%x, %u rows of "
@@ -4687,6 +4686,9 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
                         address_space_read(&address_space_memory, phys,
                                            MEMTXATTRS_UNSPECIFIED,
                                            &pixel, 4);
+                        if (s->r300) {
+                            pixel = r300_upload_word(pixel, bpp, s->r300_src_swap);
+                        }
                     }
 
                     uint64_t dst_linear = (uint64_t)dst_offset +
@@ -5211,10 +5213,8 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
                          * view after the 0x15D4 swap; store the CPU view.
                          * A swap equal to the aperture's is a plain copy.
                          */
-                        if (s->r300 && bpp == 4 && s->r300_src_swap != 2) {
-                            pixel = bswap32(r300_swap_mode(pixel, s->r300_src_swap));
-                        } else if (s->r300 && bpp == 2 && s->r300_src_swap == 0) {
-                            pixel = r300_swap_mode(pixel, 1);
+                        if (s->r300) {
+                            pixel = r300_upload_word(pixel, bpp, s->r300_src_swap);
                         }
                         xlate_ok++;
                     } else {
@@ -8175,6 +8175,11 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                                             &address_space_memory, phys,
                                             MEMTXATTRS_UNSPECIFIED,
                                             &pixel, 4);
+                                        if (s->r300) {
+                                            /* Same byte order as register-driven uploads. */
+                                            pixel = r300_upload_word(
+                                                pixel, bpp, s->r300_src_swap);
+                                        }
                                     }
                                     uint64_t d_linear = (uint64_t)dst_offset +
                                         (uint64_t)(dst_y + row) * dst_pitch +

@@ -61,3 +61,26 @@ Conflicts come almost only from QEMU's own API changes (the console, audio,
 qdev and vmstate APIs moved between 10.0 and 11.1); the device's files are new
 and do not conflict. Debug switches are listed at the top of
 `hw/display/ppc_mac_gpu.c` and in its `trace` property.
+
+### Tiger texture colours and adjacent lightmaps (2026-09-27)
+
+Q3 exposed separate failures: DXT uploads needed the VRAM/aperture byte order
+and sampled BGRA component mapping, while an intermittent turquoise wall was
+an overwritten uncompressed lightmap. The ZMASK clear used the maximum height
+seen in earlier draws. Tiger Q3 draws with a 769-row guard extent but clears a
+768-row depth buffer; the extra 4096-byte row landed in the next texture
+allocation on subsequent launches. Clears now use the current clear scissor,
+with sample count and VRAM bounds applied. The inclusive scissor convention
+also matches Mesa's R300 register definitions and clear setup.
+
+The 2D system-memory upload paths now share their source-endian conversion;
+this is a separate consistency fix, not the cause of the clear overrun.
+`tests/r300/run.sh` includes distinct-channel upload fixtures and a boundary
+regression keeping the adjacent lightmap intact. The complete suite passed,
+including Metal raster tests and cold/warm binary-archive tests. Repeated
+Tiger Q3 demo runs with texture compression enabled retained correct wall
+and floor colours after the clear fix. Host screenshots and diagnostic logs
+are retained outside the repository; no game assets are included here.
+
+Guest screenshot readback (qemu#7/#8) and Aleph One's Tiger GLSL software
+fallback (qemu#10) remain separate open problems.
