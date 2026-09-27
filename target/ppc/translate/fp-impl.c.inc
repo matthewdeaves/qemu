@@ -686,11 +686,41 @@ static void gen_mtfsfi(DisasContext *ctx)
     gen_helper_fpscr_check_status(tcg_env);
 }
 
+/*
+ * helper_todouble for a normal number, inline: every lfs and lfsx in the
+ * guest did a helper call.  Zero, denormals, Inf and NaN (a biased
+ * exponent of 0 or 255) still go to the helper.
+ */
+static void gen_todouble(TCGv_i64 dest, TCGv_i32 src)
+{
+    TCGLabel *slow = gen_new_label(), *done = gen_new_label();
+    TCGv_i32 e = tcg_temp_new_i32();
+    TCGv_i64 a = tcg_temp_new_i64(), t = tcg_temp_new_i64();
+
+    tcg_gen_extract_i32(e, src, 23, 8);
+    tcg_gen_subi_i32(e, e, 1);
+    tcg_gen_brcondi_i32(TCG_COND_GEU, e, 0xfe, slow);
+    tcg_gen_extu_i32_i64(a, src);
+    tcg_gen_andi_i64(dest, a, 0xc0000000);
+    tcg_gen_shli_i64(dest, dest, 32);              /* sign, exponent msb */
+    tcg_gen_extract_i64(t, a, 30, 1);
+    tcg_gen_xori_i64(t, t, 1);
+    tcg_gen_muli_i64(t, t, 7ull << 59);            /* exponent bits 61-59 */
+    tcg_gen_or_i64(dest, dest, t);
+    tcg_gen_andi_i64(t, a, 0x3fffffff);
+    tcg_gen_shli_i64(t, t, 29);
+    tcg_gen_or_i64(dest, dest, t);
+    tcg_gen_br(done);
+    gen_set_label(slow);
+    gen_helper_todouble(dest, src);
+    gen_set_label(done);
+}
+
 static void gen_qemu_ld32fs(DisasContext *ctx, TCGv_i64 dest, TCGv addr)
 {
     TCGv_i32 tmp = tcg_temp_new_i32();
     tcg_gen_qemu_ld_i32(tmp, addr, ctx->mem_idx, DEF_MEMOP(MO_UL));
-    gen_helper_todouble(dest, tmp);
+    gen_todouble(dest, tmp);
 }
 
 /* lfdepx (external PID lfdx) */
@@ -829,10 +859,30 @@ static void glue(gen_, name##x)(DisasContext *ctx)                            \
     gen_qemu_##stop(ctx, t0, EA);                                             \
 }
 
+/* helper_tosingle inline when no denormalisation is needed (a double
+ * exponent above 896, which includes Inf and NaN), as for stfs. */
+static void gen_tosingle(TCGv_i32 dest, TCGv_i64 src)
+{
+    TCGLabel *slow = gen_new_label(), *done = gen_new_label();
+    TCGv_i64 e = tcg_temp_new_i64(), t = tcg_temp_new_i64();
+
+    tcg_gen_extract_i64(e, src, 52, 11);
+    tcg_gen_brcondi_i64(TCG_COND_LEU, e, 896, slow);
+    tcg_gen_shri_i64(e, src, 62);
+    tcg_gen_shli_i64(e, e, 30);
+    tcg_gen_extract_i64(t, src, 29, 30);
+    tcg_gen_or_i64(e, e, t);
+    tcg_gen_extrl_i64_i32(dest, e);
+    tcg_gen_br(done);
+    gen_set_label(slow);
+    gen_helper_tosingle(dest, src);
+    gen_set_label(done);
+}
+
 static void gen_qemu_st32fs(DisasContext *ctx, TCGv_i64 src, TCGv addr)
 {
     TCGv_i32 tmp = tcg_temp_new_i32();
-    gen_helper_tosingle(tmp, src);
+    gen_tosingle(tmp, src);
     tcg_gen_qemu_st_i32(tmp, addr, ctx->mem_idx, DEF_MEMOP(MO_UL));
 }
 
