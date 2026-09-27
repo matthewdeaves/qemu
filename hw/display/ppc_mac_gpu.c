@@ -3086,6 +3086,28 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
     uint32_t ns = pkt.aa_samples;
     if (!r300_to_vram(s, &pkt.rt_gpu_addr,
                       (uint64_t)pkt.rt_pitch * pkt.rt_bpp * pkt.rt_height * ns)) {
+        /*
+         * qemu#7: this draw is dropped outright, and at least one repro
+         * (a guest screenshotJPEG/glReadPixels capture) turned out to
+         * target a perfectly valid GART-mapped address rather than a
+         * garbage one -- r300_to_vram() only ever checks the local VRAM
+         * window, so a real render-to-system-memory target reads as
+         * "outside VRAM" and is silently lost. Bring-up diagnostic to
+         * save re-deriving this by hand next time.
+         */
+        if (gpu_diag_on()) {
+            hwaddr phys = 0;
+            bool via_agp = ppc_mac_gpu_agp_translate(s, pkt.rt_gpu_addr, &phys);
+            bool via_gart = !via_agp &&
+                ppc_mac_gpu_gart_translate(s, pkt.rt_gpu_addr, &phys);
+            qemu_log("[R300_RTBOUNDS] addr=0x%x fb_base=0x%x pitch=%u bpp=%u "
+                     "height=%u samples=%u vram_size=%llu agp=%d gart=%d "
+                     "phys=0x%llx\n",
+                     pkt.rt_gpu_addr, (s->regs.mc_fb_location & 0xFFFF) << 16,
+                     pkt.rt_pitch, pkt.rt_bpp, pkt.rt_height, ns,
+                     (unsigned long long)s->vram_size, via_agp, via_gart,
+                     (unsigned long long)phys);
+        }
         r300_warn_once("colour buffer outside VRAM", NULL);
         r300_draw_free(&pkt);
         return;
