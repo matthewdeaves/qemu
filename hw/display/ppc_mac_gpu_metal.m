@@ -7327,7 +7327,21 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
  * device's flush_r200() covers them too.
  * ======================================================================== */
 
-static NSMutableDictionary<NSString *, id<MTLRenderPipelineState>> *g_r300_pipes;
+/*
+ * Compiled R300 pipelines, keyed by a hash of the MSL and the attachment
+ * formats. Each entry keeps its MSL so a hash collision is caught.
+ */
+typedef struct R300Pipe {
+    char *msl;
+    size_t len;
+    MTLPixelFormat cfmt[4];
+    uint32_t ncb;
+    MTLPixelFormat zfmt;
+    id<MTLRenderPipelineState> pipe;
+    struct R300Pipe *next;              /* same hash */
+} R300Pipe;
+static GHashTable *g_r300_pipes;        /* uint64 hash -> R300Pipe chain */
+static unsigned g_r300_npipes;
 static NSMutableDictionary<NSNumber *, id<MTLSamplerState>> *g_r300_samplers;
 
 static void r300_metal_warn(uint32_t bit, const char *msg)
@@ -7344,28 +7358,42 @@ static void r300_metal_warn(uint32_t bit, const char *msg)
  * for a colour-only pass (r300_fs), else the format of the depth/stencil
  * buffer bound as colour attachment ncb (r300_fs_z).
  */
+static uint64_t r300_hash(const uint8_t *p, size_t n);
+
+/*
+ * The pipeline for this MSL and these attachments, compiled on first use.
+ * This runs on every draw, and compiling is milliseconds, so the lookup
+ * must be cheap and the key exact: a key that differed between draws of
+ * the same shader once had the vCPU compiling Metal for 90% of its time.
+ */
 static id<MTLRenderPipelineState> r300_pipeline(id<MTLDevice> dev,
                                                 const char *msl,
                                                 const MTLPixelFormat *cfmt,
                                                 uint32_t ncb,
                                                 MTLPixelFormat zfmt)
 {
-    NSString *src = [NSString stringWithUTF8String:msl];
-    NSMutableString *key = [NSMutableString stringWithString:src];
-    id<MTLRenderPipelineState> p;
+    size_t len = strlen(msl);
+    uint64_t h = r300_hash((const uint8_t *)msl, len);
     NSError *err = nil;
 
     for (uint32_t k = 0; k < ncb; k++) {
-        [key appendFormat:@"\n// c%u %lu", k, (unsigned long)cfmt[k]];
+        h = (h ^ (uint64_t)cfmt[k]) * 0x9E3779B97F4A7C15ull;
     }
-    [key appendFormat:@"\n// z %lu\n", (unsigned long)zfmt];
+    h = (h ^ (uint64_t)zfmt ^ ((uint64_t)ncb << 32)) * 0x9E3779B97F4A7C15ull;
     if (!g_r300_pipes) {
-        g_r300_pipes = [[NSMutableDictionary alloc] init];
+        g_r300_pipes = g_hash_table_new_full(g_int64_hash, g_int64_equal,
+                                             g_free, NULL);
     }
-    p = g_r300_pipes[key];
-    if (p) {
-        return p;
+    R300Pipe *head = g_hash_table_lookup(g_r300_pipes, &h);
+    for (R300Pipe *e = head; e; e = e->next) {
+        if (e->len == len && e->ncb == ncb && e->zfmt == zfmt &&
+            ncb <= 4 && !memcmp(e->cfmt, cfmt, ncb * sizeof(*cfmt)) &&
+            !memcmp(e->msl, msl, len)) {
+            return e->pipe;
+        }
     }
+
+    NSString *src = [NSString stringWithUTF8String:msl];
     id<MTLLibrary> lib = [dev newLibraryWithSource:src options:nil error:&err];
     if (!lib) {
         qemu_log("ppc-mac-gpu r300: shader compile failed: %s\n%s\n",
@@ -7380,7 +7408,8 @@ static id<MTLRenderPipelineState> r300_pipeline(id<MTLDevice> dev,
         pd.colorAttachments[k].pixelFormat = cfmt[k];
     }
     pd.colorAttachments[ncb].pixelFormat = zfmt;
-    p = [dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    id<MTLRenderPipelineState> p =
+        [dev newRenderPipelineStateWithDescriptor:pd error:&err];
     [pd release];
     [lib release];
     if (!p) {
@@ -7388,11 +7417,18 @@ static id<MTLRenderPipelineState> r300_pipeline(id<MTLDevice> dev,
                  err.localizedDescription.UTF8String);
         return nil;
     }
-    g_r300_pipes[key] = p;
-    [p release];
-    if (g_r300_pipes.count % 16 == 1) {
-        qemu_log("ppc-mac-gpu r300: %lu fragment pipelines\n",
-                 (unsigned long)g_r300_pipes.count);
+
+    R300Pipe *e = g_new0(R300Pipe, 1);
+    e->msl = g_memdup2(msl, len);
+    e->len = len;
+    memcpy(e->cfmt, cfmt, MIN(ncb, 4u) * sizeof(*cfmt));
+    e->ncb = ncb;
+    e->zfmt = zfmt;
+    e->pipe = p;                        /* the table owns the reference */
+    e->next = head;
+    g_hash_table_replace(g_r300_pipes, g_memdup2(&h, sizeof(h)), e);
+    if (++g_r300_npipes % 16 == 1) {
+        qemu_log("ppc-mac-gpu r300: %u fragment pipelines\n", g_r300_npipes);
     }
     return p;
 }
