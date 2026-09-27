@@ -722,6 +722,15 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 {
     /* Return true if we handled the event, false if it should be given to OSX */
     COCOA_DEBUG("QemuCocoaView: handleEvent\n");
+
+    /*
+     * When the guest powers off, cocoa_display_cleanup() frees the keyboard
+     * state from the main loop while AppKit is still delivering events here.
+     * Both run under the BQL, so a NULL kbd means QEMU is going away.
+     */
+    if (!kbd) {
+        return false;
+    }
     InputButton button;
     unsigned int keycode;
     NSUInteger modifiers = [event modifierFlags];
@@ -1110,7 +1119,9 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 - (void) raiseAllKeys
 {
     with_bql(^{
-        qkbd_state_lift_all_keys(kbd);
+        if (kbd) {      /* NULL once cocoa_display_cleanup() has run */
+            qkbd_state_lift_all_keys(kbd);
+        }
     });
 }
 
