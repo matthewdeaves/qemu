@@ -1197,6 +1197,7 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
     float fog_scale = bits_to_float(r300_reg(st, GA_FOG_SCALE));
     float fog_off = bits_to_float(r300_reg(st, GA_FOG_OFFSET));
     R300PVSProgram prog;
+    R300PVSPrepared prepared;
     float consts[256][4];
     Build b;
 
@@ -1284,6 +1285,10 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
         prog.fc_loop[i] = r300_reg(st, VAP_PVS_FLOW_CNTL_LOOP_INDEX_0 + 4 * i);
     }
 
+    if (!bypass) {
+        r300_pvs_prepare(&prepared, &prog);
+    }
+
     output_layout(st, &lay);
     rs_route(st, &route, &desc, &pkt->warn);
 
@@ -1320,7 +1325,7 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
         if (bypass) {
             memcpy(out, in, sizeof(outs[j]));
         } else {
-            uint32_t u = r300_pvs_run(&prog, (const float (*)[4])in, out);
+            uint32_t u = r300_pvs_run_prepared(&prepared, (const float (*)[4])in, out);
             if (u & R300_PVS_UNSUP_FLOW) {
                 pkt->warn |= R300_WARN_FLOW;
             }

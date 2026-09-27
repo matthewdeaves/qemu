@@ -39,6 +39,37 @@ typedef struct R300PVSProgram {
     uint32_t fc_loop[16];
 } R300PVSProgram;
 
+/* Prepared operands contain no per-vertex pointers. */
+typedef struct R300PVSSource {
+    uint8_t type, mode, sel, index;
+    uint8_t swizzle[4];
+    uint8_t abs, neg, identity;
+} R300PVSSource;
+
+typedef struct R300PVSDest {
+    uint8_t type, mode, sel, index, mask;
+} R300PVSDest;
+
+typedef struct R300PVSInst {
+    R300PVSSource src[3];
+    R300PVSDest dst;
+    uint8_t op, math, dual, sat, math_sat, pred;
+    uint8_t dual_op, dual_index, dual_comp;
+} R300PVSInst;
+
+typedef struct R300PVSPrepared {
+    R300PVSProgram prog;
+    unsigned num_temps, num_alt;
+    R300PVSInst inst[R300_PVS_MAX_INSTS];
+} R300PVSPrepared;
+
+/* Snapshot code and flow control once per draw. Constant storage remains
+ * borrowed and must stay live while running. Inputs are resolved per vertex. */
+void r300_pvs_prepare(R300PVSPrepared *prepared, const R300PVSProgram *prog);
+uint32_t r300_pvs_run_prepared(const R300PVSPrepared *prepared,
+                             const float in[R300_PVS_NUM_INPUTS][4],
+                             float out[R300_PVS_NUM_OUTPUTS][4]);
+
 /*
  * Run the program for one vertex.  in[] is the input vertex memory (IVM),
  * out[] receives the output vertex memory (OVM); outputs the program does
@@ -50,6 +81,7 @@ typedef struct R300PVSProgram {
 #define R300_PVS_UNSUP_OPCODE   (1u << 2)   /* unknown opcode */
 #define R300_PVS_UNSUP_RELDST   (1u << 3)   /* relative destination address */
 
+/* Convenience entry point for callers that do not reuse a program. */
 uint32_t r300_pvs_run(const R300PVSProgram *prog,
                       const float in[R300_PVS_NUM_INPUTS][4],
                       float out[R300_PVS_NUM_OUTPUTS][4]);

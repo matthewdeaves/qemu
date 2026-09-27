@@ -70,6 +70,61 @@ static void flow_control(void)
     assert(r300_pvs_run(&r, in, out) & R300_PVS_UNSUP_FLOW);
 }
 
+static void prepared_program(void)
+{
+    static const float k[8][4] = {
+        { 1, 1, 1, 1 }, { 10, 20, 30, 40 }, { -2, 3, -4, 5 },
+    };
+    uint32_t code[] = {
+        DST(1, 0, 15), SRC(2, 0, 0), SRC(2, 7, 0), 0,
+        /* A0-relative destination and AL-relative source; t127 starts zero. */
+        DST(0, 126, 15) | (1u << 31), SRC(0, 127, 0), SRC(2, 1, 1), 0,
+        /* abs(c[1+A0].zx10), then negate x and w. */
+        DST(0, 0, 15), SRC(0, 0, 0),
+        2u | 8u | 16u | (1u << 5) | (2u << 13) | (5u << 19) |
+        (4u << 22) | (9u << 25), 0,
+        /* Dual math reads old alt0.xy, then overwrites vector result's z. */
+        DST(4, 0, 15) | (1u << 28), SRC(2, 2, 0), SRC(2, 7, 0),
+        3u | (1u << 16) | (10u << 21) | (2u << 27),
+        DST(2, 0, 15), SRC(0, 0, 0), SRC(2, 7, 0), 0,
+        DST(2, 1, 15), SRC(0, 127, 0), SRC(2, 7, 0), 0,
+        DST(2, 2, 15), SRC(3, 0, 0), SRC(2, 7, 0), 0,
+        /* Macro M2X_ADD and saturation, then replicate x. */
+        DST(3, 3, 15) | (1u << 7) | (1u << 24),
+        SRC(0, 0, 0), SRC(2, 2, 0), SRC(2, 7, 0),
+        /* Out-of-range relative source reads zero; destination is dropped. */
+        DST(2, 31, 15) | (1u << 31), SRC(0, 127, 0) | 16u,
+        SRC(2, 7, 0), 0,
+        DST(2, 4, 15), SRC(0, 127, 0) | 16u, SRC(2, 255, 0), 0,
+    };
+    static const float expected[5][4] = {
+        { -8, 4, 2, 0 }, { 8, 23, 26, 45 }, { -2, 3, -6, 5 },
+        { 1, 1, 1, 1 }, { 0, 0, 0, 0 },
+    };
+    R300PVSProgram p = { code, 0, 9, k, 7 };
+    R300PVSPrepared prepared;
+    float in[32][4] = { { 0 } }, out[32][4];
+
+    p.fc_opc = 2;
+    p.fc_addrs[0] = (2u << 8) | (3u << 16) | (1u << 24);
+    p.fc_loop[0] = 1u << 8;
+    r300_pvs_prepare(&prepared, &p);
+    assert(prepared.num_temps == 128);
+    /* Execution uses the snapshot, including flow descriptors. */
+    memset(code, 0, sizeof(code));
+    p.fc_opc = 0;
+    for (int vertex = 0; vertex < 3; vertex++) {
+        for (int i = 0; i < 32; i++) {
+            for (int j = 0; j < 4; j++) {
+                out[i][j] = 99.0f;
+            }
+        }
+        assert(!r300_pvs_run_prepared(&prepared, in, out));
+        assert(!memcmp(out, expected, sizeof(expected)));
+        assert(out[31][0] == 99.0f && out[5][0] == 99.0f);
+    }
+}
+
 int main(void)
 {
     const float consts[8][4] = {
@@ -98,6 +153,7 @@ int main(void)
     assert(out[1][0] == 1 && out[1][3] == 1);          /* colour passes through */
     assert(fabsf(out[2][0] - 1) < 1e-6 && fabsf(out[2][1] - 1) < 1e-6);
     flow_control();
+    prepared_program();
     puts("PASS");
     return 0;
 }

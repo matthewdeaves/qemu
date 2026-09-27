@@ -37,7 +37,7 @@ enum {
     ME_LOG_BASE2_IEEE, ME_RECIP_IEEE, ME_RECIP_SQRT_IEEE,
 };
 
-enum { SRC_TEMP = 0, SRC_INPUT, SRC_CONST, SRC_ALT };
+enum { SRC_TEMP = 0, SRC_INPUT, SRC_CONST, SRC_ALT, SRC_ZERO };
 enum { DST_TEMP = 0, DST_A0, DST_OUT, DST_OUT_REPL_X, DST_ALT, DST_INPUT };
 
 typedef struct PVSRegs {
@@ -51,6 +51,7 @@ typedef struct PVSCtx {
     const float (*in)[4];
     float (*out)[4];
     PVSRegs r;
+    const float (*base[5])[4];
     int al;                 /* fixed-point loop index of the innermost loop */
     uint32_t unsup;
 } PVSCtx;
@@ -85,31 +86,41 @@ static int pvs_rel(PVSCtx *c, unsigned mode, unsigned sel, unsigned offset)
     return offset;
 }
 
-static int pvs_addr(PVSCtx *c, uint32_t s, unsigned offset)
-{
-    return pvs_rel(c, ((s >> 4) & 1) | ((s >> 31) << 1), s >> 29, offset);
-}
-
 static float pvs_select(const float *v, unsigned sel)
 {
     return sel < 4 ? v[sel] : sel == 5 ? 1.0f : 0.0f;
 }
 
-/* A regular source operand, swizzled, with abs and negate applied. */
-static void pvs_src(PVSCtx *c, uint32_t s, float o[4])
+static const float *pvs_source_mem(PVSCtx *c, const R300PVSSource *s)
 {
-    const float *v = pvs_mem(c, s & 3, pvs_addr(c, s, (s >> 5) & 0xFF));
+    int index = s->index;
 
+    if (!s->mode) {
+        return c->base[s->type][s->index];
+    }
+    index = pvs_rel(c, s->mode, s->sel, index);
+    return pvs_mem(c, s->type, index);
+}
+
+/* Identity operands can be consumed directly before either result is written. */
+static const float *pvs_src(PVSCtx *c, const R300PVSSource *s, float o[4])
+{
+    const float *v = pvs_source_mem(c, s);
+
+    if (s->identity) {
+        return v;
+    }
     for (int i = 0; i < 4; i++) {
-        float x = pvs_select(v, (s >> (13 + 3 * i)) & 7);
-        if (s & (1u << 3)) {
+        float x = pvs_select(v, s->swizzle[i]);
+        if (s->abs) {
             x = fabsf(x);
         }
-        if (s & (1u << (25 + i))) {
+        if (s->neg & (1u << i)) {
             x = -x;
         }
         o[i] = x;
     }
+    return o;
 }
 
 static float pvs_pow_ff(float base, float e)
@@ -258,13 +269,11 @@ static void pvs_sat(float r[4])
     }
 }
 
-static void pvs_write(PVSCtx *c, uint32_t d0, const float r[4])
+static void pvs_write(PVSCtx *c, const R300PVSDest *d, const float r[4])
 {
-    unsigned type = (d0 >> 8) & 0xF;
-    unsigned mask = (d0 >> 20) & 0xF;
-    /* ADDR_MODE_0 is bit 31, ADDR_MODE_1 bit 12 */
-    unsigned mode = ((d0 >> 31) & 1) | (((d0 >> 12) & 1) << 1);
-    int rel = pvs_rel(c, mode, d0 >> 29, (d0 >> 13) & 0x7F);
+    unsigned type = d->type;
+    unsigned mask = d->mask;
+    int rel = pvs_rel(c, d->mode, d->sel, d->index);
     unsigned index = rel < 0 ? ~0u : (unsigned)rel;
     float *dst;
 
@@ -370,87 +379,174 @@ static unsigned pvs_flow(const R300PVSProgram *prog, PVSCtx *c, unsigned pc,
 }
 
 /* One instruction. */
-static void pvs_exec(PVSCtx *c, const uint32_t *d)
+static void pvs_exec(PVSCtx *c, const R300PVSInst *d)
 {
-    uint32_t d0 = d[0];
-    unsigned op = d0 & 0x3F;
-    bool math = (d0 >> 6) & 1;
-    bool macro = (d0 >> 7) & 1;
-    bool dual = !math && !macro && ((d0 >> 28) & 1);
-    float a[4], b[4], cc[4], r[4];
+    float av[4], bv[4], cv[4], r[4];
+    const float *a, *b, *cc = cv;
 
-    if ((d0 >> 26) & 1) {
+    if (d->pred) {
         c->unsup |= R300_PVS_UNSUP_PRED;
     }
-    pvs_src(c, d[1], a);
-    pvs_src(c, d[2], b);
-    if (!dual) {
-        pvs_src(c, d[3], cc);
+    a = pvs_src(c, &d->src[0], av);
+    b = pvs_src(c, &d->src[1], bv);
+    if (!d->dual) {
+        cc = pvs_src(c, &d->src[2], cv);
     }
 
-    if (math) {
-        pvs_math(c, op, a[3], b[3], cc[3], r);
-        if ((d0 >> 25) & 1) {
+    if (d->math) {
+        pvs_math(c, d->op, a[3], b[3], cc[3], r);
+        if (d->math_sat) {
             pvs_sat(r);
         }
-        pvs_write(c, d0, r);
+        pvs_write(c, &d->dst, r);
         return;
     }
 
-    if (macro) {
-        /* Two-clock MAD/M2X_ADD with three distinct temporaries. */
-        pvs_vector(c, (op & 1) ? VE_MULTIPLYX2_ADD : VE_MULTIPLY_ADD,
-                   a, b, cc, r);
-    } else {
-        pvs_vector(c, op, a, b, cc, r);
-    }
-    if ((d0 >> 24) & 1) {
+    pvs_vector(c, d->op, a, b, cc, r);
+    if (d->sat) {
         pvs_sat(r);
     }
 
-    if (dual) {
+    if (d->dual) {
         /* The third source dword describes a math op writing ATRM 0-3. */
-        uint32_t s = d[3];
-        unsigned mop = ((s >> 21) & 0xF) | (((s >> 2) & 1) << 4);
-        const float *v = pvs_mem(c, s & 3, pvs_addr(c, s, (s >> 5) & 0xFF));
-        float x = pvs_select(v, (s >> 13) & 7);
-        float y = pvs_select(v, (s >> 16) & 7);
+        const R300PVSSource *s = &d->src[2];
+        const float *v = pvs_source_mem(c, s);
+        float x = pvs_select(v, s->swizzle[0]);
+        float y = pvs_select(v, s->swizzle[1]);
         float mr[4];
 
-        if (s & (1u << 3)) {
+        if (s->abs) {
             x = fabsf(x);
             y = fabsf(y);
         }
-        if (s & (1u << 25)) {
+        if (s->neg & 1) {
             x = -x;
         }
-        if (s & (1u << 26)) {
+        if (s->neg & 2) {
             y = -y;
         }
-        pvs_math(c, mop, x, y, y, mr);
-        if ((d0 >> 25) & 1) {
+        pvs_math(c, d->dual_op, x, y, y, mr);
+        if (d->math_sat) {
             pvs_sat(mr);
         }
-        pvs_write(c, d0, r);   /* vector result first... */
-        {
-            unsigned comp = (s >> 27) & 3;
-            c->r.alt[(s >> 19) & 3][comp] = mr[comp];  /* ...then math */
-        }
+        /* Both engines read before the vector and then math results are written. */
+        pvs_write(c, &d->dst, r);
+        c->r.alt[d->dual_index][d->dual_comp] = mr[d->dual_comp];
         return;
     }
-    pvs_write(c, d0, r);
+    pvs_write(c, &d->dst, r);
+}
+
+void r300_pvs_prepare(R300PVSPrepared *prepared, const R300PVSProgram *prog)
+{
+    prepared->prog = *prog;
+    prepared->num_temps = 0;
+    prepared->num_alt = 0;
+    if (prog->first_inst > prog->last_inst ||
+        prog->first_inst >= R300_PVS_MAX_INSTS) {
+        return;
+    }
+    /* Flow targets may precede first_inst. */
+    unsigned first = prog->fc_opc ? 0 : prog->first_inst;
+
+    for (unsigned pc = first;
+         pc <= prog->last_inst && pc < R300_PVS_MAX_INSTS; pc++) {
+        const uint32_t *words = &prog->code[pc * 4];
+        uint32_t w = words[0];
+        R300PVSInst *d = &prepared->inst[pc];
+        bool macro = (w >> 7) & 1;
+
+        d->op = w & 0x3F;
+        d->math = (w >> 6) & 1;
+        d->dual = !d->math && !macro && ((w >> 28) & 1);
+        if (macro && !d->math) {
+            d->op = (d->op & 1) ? VE_MULTIPLYX2_ADD : VE_MULTIPLY_ADD;
+        }
+        d->sat = (w >> 24) & 1;
+        d->math_sat = (w >> 25) & 1;
+        d->pred = (w >> 26) & 1;
+        d->dst.type = (w >> 8) & 15;
+        d->dst.mode = (w >> 31) | (((w >> 12) & 1) << 1);
+        d->dst.sel = (w >> 29) & 3;
+        d->dst.index = (w >> 13) & 127;
+        d->dst.mask = (w >> 20) & 15;
+        d->dual_op = ((words[3] >> 21) & 15) |
+                     (((words[3] >> 2) & 1) << 4);
+        d->dual_index = (words[3] >> 19) & 3;
+        d->dual_comp = (words[3] >> 27) & 3;
+        for (int k = 0; k < 3; k++) {
+            R300PVSSource *s = &d->src[k];
+            uint32_t word = words[k + 1];
+
+            s->type = word & 3;
+            s->mode = ((word >> 4) & 1) | ((word >> 31) << 1);
+            s->sel = (word >> 29) & 3;
+            s->index = (word >> 5) & 255;
+            s->abs = (word >> 3) & 1;
+            s->neg = (word >> 25) & 15;
+            s->identity = !s->abs && !s->neg;
+            for (int i = 0; i < 4; i++) {
+                s->swizzle[i] = (word >> (13 + 3 * i)) & 7;
+                s->identity &= s->swizzle[i] == i;
+            }
+            if (s->type == SRC_TEMP || s->type == SRC_ALT) {
+                unsigned limit = s->type == SRC_TEMP ? R300_PVS_NUM_TEMPS :
+                                                      R300_PVS_NUM_ALT_TEMPS;
+                unsigned *count = s->type == SRC_TEMP ? &prepared->num_temps :
+                                                      &prepared->num_alt;
+                /* Mode 3 is absolute, just as in pvs_rel. */
+                unsigned used = s->mode == 1 || s->mode == 2 ? limit :
+                                s->index < limit ? s->index + 1 : 0;
+                if (used > *count) {
+                    *count = used;
+                }
+            }
+            if (s->mode == 3) {
+                s->mode = 0;
+            }
+            if (!s->mode) {
+                int last = s->type == SRC_TEMP ? R300_PVS_NUM_TEMPS - 1 :
+                           s->type == SRC_ALT ? R300_PVS_NUM_ALT_TEMPS - 1 :
+                           s->type == SRC_INPUT ? R300_PVS_NUM_INPUTS - 1 :
+                           prog->max_const;
+                /* Absolute bounds checks are independent of the vertex. */
+                if (s->index > last) {
+                    s->type = SRC_ZERO;
+                    s->index = 0;
+                }
+            }
+        }
+    }
 }
 
 uint32_t r300_pvs_run(const R300PVSProgram *prog,
                       const float in[R300_PVS_NUM_INPUTS][4],
                       float out[R300_PVS_NUM_OUTPUTS][4])
 {
-    PVSCtx c;
+    R300PVSPrepared prepared;
 
-    memset(&c.r, 0, sizeof(c.r));
+    r300_pvs_prepare(&prepared, prog);
+    return r300_pvs_run_prepared(&prepared, in, out);
+}
+
+uint32_t r300_pvs_run_prepared(const R300PVSPrepared *prepared,
+                             const float in[R300_PVS_NUM_INPUTS][4],
+                             float out[R300_PVS_NUM_OUTPUTS][4])
+{
+    PVSCtx c;
+    const R300PVSProgram *prog = &prepared->prog;
+
+    memset(c.r.temp, 0, prepared->num_temps * sizeof(c.r.temp[0]));
+    memset(c.r.alt, 0, prepared->num_alt * sizeof(c.r.alt[0]));
+    memset(c.r.a0, 0, sizeof(c.r.a0));
     c.prog = prog;
     c.in = in;
     c.out = out;
+    c.base[SRC_TEMP] = c.r.temp;
+    c.base[SRC_INPUT] = in;
+    c.base[SRC_CONST] = prog->consts;
+    c.base[SRC_ALT] = c.r.alt;
+    c.base[SRC_ZERO] = &zero4;
     c.unsup = 0;
 
     /* Flow control state: active loops (innermost last) and subroutine
@@ -466,7 +562,7 @@ uint32_t r300_pvs_run(const R300PVSProgram *prog,
             c.unsup |= R300_PVS_UNSUP_FLOW;     /* runaway loop */
             break;
         }
-        pvs_exec(&c, &prog->code[pc * 4]);
+        pvs_exec(&c, &prepared->inst[pc]);
         next = prog->fc_opc ? pvs_flow(prog, &c, pc, loop, &nloop, jsr, &njsr)
                             : pc + 1;
     }
