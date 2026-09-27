@@ -554,7 +554,7 @@ void r300_tex_level_dims(const R300TexDesc *td, uint32_t l, uint32_t *w,
 void r300_tex_layout(R300TexDesc *td, uint32_t bpp, bool dxt, bool pitch_en)
 {
     bool pot_rows = td->levels > 1 || td->dim != R300_TEXDIM_2D;
-    uint32_t off = 0;
+    uint64_t off = 0;
 
     for (uint32_t l = 0; l < td->levels; l++) {
         uint32_t w, h, d, pitch, rows;
@@ -563,22 +563,22 @@ void r300_tex_layout(R300TexDesc *td, uint32_t bpp, bool dxt, bool pitch_en)
         if (pot_rows) {
             h = pot_ceil(h);
         }
-        if (dxt) {
-            pitch = (((w + 3) / 4) * bpp + 31) & ~31u;
-            rows = (h + 3) / 4;
-        } else {
-            pitch = (w * bpp + 31) & ~31u;
-            rows = h;
-        }
+        uint32_t row = dxt ? ((w + 3) / 4) * bpp : w * bpp;
+        pitch = (row + 31) & ~31u;
+        rows = dxt ? (h + 3) / 4 : h;
         if (l == 0 && pitch_en) {
-            pitch = td->pitch_bytes;
+            /* the guest's pitch, but never less than a row: the renderer
+             * reads whole rows (a 2-byte pitch under a 2048-texel row
+             * would read far past the size this layout reports) */
+            pitch = td->pitch_bytes > row ? td->pitch_bytes : row;
         }
-        td->lvl_off[l] = off;
+        td->lvl_off[l] = off > UINT32_MAX ? UINT32_MAX : (uint32_t)off;
         td->lvl_pitch[l] = pitch;
         td->lvl_rows[l] = rows;
-        off += pitch * rows * d;
+        off += (uint64_t)pitch * rows * d;
     }
-    td->size_bytes = off;
+    /* saturates: a size past 4 GB fails every bounds check */
+    td->size_bytes = off > UINT32_MAX ? UINT32_MAX : (uint32_t)off;
 }
 
 static float un_bits(uint32_t v, unsigned sh, unsigned n)

@@ -2415,6 +2415,9 @@ static void r300_zmask_clear(PPCMacGPUState *s)
         return;
     }
     off -= fb_base;
+    if (off >= s->vram_size) {
+        return;         /* else the clamp below underflows into a huge write */
+    }
     if (off + bpr * rows > s->vram_size) {
         rows = (s->vram_size - off) / bpr;
     }
@@ -2476,6 +2479,9 @@ static void r300_cmask_clear(PPCMacGPUState *s)
     }
     off -= fb_base;
     rows *= r300_cb_samples(s, off);     /* every sample's rows */
+    if (off >= s->vram_size) {
+        return;         /* else the clamp below underflows into a huge write */
+    }
     if (off + bpr * rows > s->vram_size) {
         rows = (s->vram_size - off) / bpr;
     }

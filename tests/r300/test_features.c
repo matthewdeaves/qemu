@@ -476,6 +476,23 @@ int main(void)
         uint32_t tex = (uint32_t)b[0] << 24 | b[1] << 16 | b[2] << 8 | b[3];
         CHECK(tex == dw, "COLOR_ENDIAN %u reads back as %08x", e, tex);
     }
+    /* Texture layout never reports less than the renderer reads: a guest
+     * pitch under one row is raised to the row, and a size past 4 GB
+     * saturates instead of wrapping. */
+    {
+        R300TexDesc t = { 0 };
+        t.width = 2048; t.height = 1; t.depth = 1; t.levels = 1;
+        t.dim = R300_TEXDIM_2D; t.pitch_bytes = 2;
+        r300_tex_layout(&t, 2, false, true);
+        CHECK(t.lvl_pitch[0] >= 4096 && t.size_bytes >= 4096,
+              "short pitch: pitch %u size %u", t.lvl_pitch[0], t.size_bytes);
+        R300TexDesc b = { 0 };
+        b.width = 2048; b.height = 2048; b.depth = 2048; b.levels = 1;
+        b.dim = R300_TEXDIM_3D;
+        r300_tex_layout(&b, 16, false, false);
+        CHECK(b.size_bytes == UINT32_MAX, "3D size wrapped to %u", b.size_bytes);
+    }
+
     rendering_completeness();
     printf(fails ? "test_features: %d FAILED\n" : "test_features: PASS\n", fails);
     return fails != 0;
