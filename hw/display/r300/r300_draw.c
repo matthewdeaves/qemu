@@ -1454,7 +1454,7 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
     free(xv);
     free(order);
 
-    pkt->msl = r300_us_to_msl(st, &desc, err);
+    pkt->msl = r300_us_msl_cached(st, &desc, &pkt->msl_id, &pkt->msl_ow_ar, err);
     if (!pkt->msl) {
         r300_draw_free(pkt);
         return false;
@@ -1580,7 +1580,6 @@ bool r300_draw_build_indexed(const R300State *st, const R300Arrays *arr,
 
 void r300_draw_free(R300DrawPacket *pkt)
 {
-    free(pkt->msl);
     free(pkt->verts);
     pkt->msl = NULL;
     pkt->verts = NULL;

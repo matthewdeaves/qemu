@@ -108,6 +108,17 @@ char *r300_us_to_msl(const R300State *st, const R300FSDesc *desc,
                      const char **err);
 
 /*
+ * r300_us_to_msl() for the draw path, which needs the same program over
+ * and over: the MSL is generated once per distinct set of the registers
+ * it depends on and kept.  Returns the cached source (owned by the cache,
+ * never freed) and in *id a number unique to it, so callers can key their
+ * own caches on the number instead of the text.  *ow_ar is whether the
+ * program writes its W output from alpha ("ow = ar").
+ */
+const char *r300_us_msl_cached(const R300State *st, const R300FSDesc *desc,
+                               uint32_t *id, bool *ow_ar, const char **err);
+
+/*
  * Texture formats (TX_FORMAT1.TXFORMAT) the shader decodes itself from the
  * texel words, read through a uint view of guest memory: returns the texel
  * size in bytes, or 0 for the formats sampled through a float texture

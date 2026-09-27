@@ -7328,12 +7328,11 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
  * ======================================================================== */
 
 /*
- * Compiled R300 pipelines, keyed by a hash of the MSL and the attachment
- * formats. Each entry keeps its MSL so a hash collision is caught.
+ * Compiled R300 pipelines, keyed by the translation cache's id for the MSL
+ * (r300_us_msl_cached) and the attachment formats.
  */
 typedef struct R300Pipe {
-    char *msl;
-    size_t len;
+    uint32_t msl_id;
     MTLPixelFormat cfmt[4];
     uint32_t ncb;
     MTLPixelFormat zfmt;
@@ -7358,22 +7357,21 @@ static void r300_metal_warn(uint32_t bit, const char *msg)
  * for a colour-only pass (r300_fs), else the format of the depth/stencil
  * buffer bound as colour attachment ncb (r300_fs_z).
  */
-static uint64_t r300_hash(const uint8_t *p, size_t n);
-
 /*
  * The pipeline for this MSL and these attachments, compiled on first use.
  * This runs on every draw, and compiling is milliseconds, so the lookup
  * must be cheap and the key exact: a key that differed between draws of
- * the same shader once had the vCPU compiling Metal for 90% of its time.
+ * the same shader once had the vCPU compiling Metal for 90% of its time,
+ * and hashing the ~40 KB of MSL instead cost 10%.
  */
 static id<MTLRenderPipelineState> r300_pipeline(id<MTLDevice> dev,
                                                 const char *msl,
+                                                uint32_t msl_id,
                                                 const MTLPixelFormat *cfmt,
                                                 uint32_t ncb,
                                                 MTLPixelFormat zfmt)
 {
-    size_t len = strlen(msl);
-    uint64_t h = r300_hash((const uint8_t *)msl, len);
+    uint64_t h = (uint64_t)msl_id * 0x9E3779B97F4A7C15ull;
     NSError *err = nil;
 
     for (uint32_t k = 0; k < ncb; k++) {
@@ -7386,9 +7384,8 @@ static id<MTLRenderPipelineState> r300_pipeline(id<MTLDevice> dev,
     }
     R300Pipe *head = g_hash_table_lookup(g_r300_pipes, &h);
     for (R300Pipe *e = head; e; e = e->next) {
-        if (e->len == len && e->ncb == ncb && e->zfmt == zfmt &&
-            ncb <= 4 && !memcmp(e->cfmt, cfmt, ncb * sizeof(*cfmt)) &&
-            !memcmp(e->msl, msl, len)) {
+        if (e->msl_id == msl_id && e->ncb == ncb && e->zfmt == zfmt &&
+            ncb <= 4 && !memcmp(e->cfmt, cfmt, ncb * sizeof(*cfmt))) {
             return e->pipe;
         }
     }
@@ -7419,8 +7416,7 @@ static id<MTLRenderPipelineState> r300_pipeline(id<MTLDevice> dev,
     }
 
     R300Pipe *e = g_new0(R300Pipe, 1);
-    e->msl = g_memdup2(msl, len);
-    e->len = len;
+    e->msl_id = msl_id;
     memcpy(e->cfmt, cfmt, MIN(ncb, 4u) * sizeof(*cfmt));
     e->ncb = ncb;
     e->zfmt = zfmt;
@@ -7601,22 +7597,35 @@ static void r300_decode16(uint32_t fmt, uint16_t v, uint8_t out[4])
     out[0] = x; out[1] = y; out[2] = z; out[3] = w;
 }
 
-/* 64-bit content hash for the copied-texture cache (wyhash-style mix). */
+/*
+ * 64-bit content hash for the copied-texture cache. It runs over whole mip
+ * chains on every bind, so it keeps four independent lanes (32 bytes a
+ * step) for the multiplies to overlap; one lane was 9% of the vCPU in
+ * Quake.
+ */
 static uint64_t r300_hash(const uint8_t *p, size_t n)
 {
-    const uint64_t m = 0x9E3779B97F4A7C15ull;
-    uint64_t h = n * m, v;
+    const uint64_t m1 = 0x9E3779B97F4A7C15ull, m2 = 0xC2B2AE3D27D4EB4Full;
+    uint64_t h0 = n * m1, h1 = ~n, h2 = n ^ m2, h3 = n + m1, v;
     size_t i = 0;
 
+    for (; i + 32 <= n; i += 32) {
+        memcpy(&v, p + i, 8);      h0 = (h0 ^ v) * m1; h0 ^= h0 >> 29;
+        memcpy(&v, p + i + 8, 8);  h1 = (h1 ^ v) * m2; h1 ^= h1 >> 31;
+        memcpy(&v, p + i + 16, 8); h2 = (h2 ^ v) * m1; h2 ^= h2 >> 29;
+        memcpy(&v, p + i + 24, 8); h3 = (h3 ^ v) * m2; h3 ^= h3 >> 31;
+    }
+    uint64_t h = h0 ^ (h1 * m1) ^ (h2 * m2) ^ (h3 * (m1 ^ m2));
     for (; i + 8 <= n; i += 8) {
         memcpy(&v, p + i, 8);
-        h = (h ^ v) * m;
+        h = (h ^ v) * m1;
         h ^= h >> 29;
     }
     for (; i < n; i++) {
-        h = (h ^ p[i]) * m;
+        h = (h ^ p[i]) * m1;
     }
-    return h ^ (h >> 32);
+    h ^= h >> 32;
+    return h * m2 ^ (h >> 29);
 }
 
 /*
@@ -8095,7 +8104,8 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         if (ncb != MAX(pkt->num_cb, 1u)) {
             return -1;                  /* the MSL declares targets we cannot bind */
         }
-        id<MTLRenderPipelineState> pipe = r300_pipeline(dev, pkt->msl, cpf, ncb, pass_zpf);
+        id<MTLRenderPipelineState> pipe = r300_pipeline(dev, pkt->msl, pkt->msl_id, cpf, ncb,
+                                                    pass_zpf);
         if (!pipe) {
             return -1;
         }

@@ -1461,6 +1461,122 @@ char *r300_us_to_msl(const R300State *st, const R300FSDesc *desc,
     return r300_sb_steal(&sb);
 }
 
+/* ---- translation cache ---------------------------------------------- */
+
+/* Everything r300_us_to_msl() reads: equal keys give equal MSL. */
+typedef struct R300USKey {
+    uint32_t config, code_offset, code_addr[4];
+    uint32_t tex_inst[R300_US_MAX_TEX];
+    uint32_t alu[4][R300_US_MAX_ALU];   /* RGB/alpha ADDR, RGB/alpha INST */
+    uint32_t out_fmt[4], colorpitch[4];
+    uint32_t tx_enable, tx_filter0[16], tx_format1[16], tx_swap[16];
+    uint32_t cctl, clip_cntl;
+    R300FSDesc desc;
+} R300USKey;
+
+typedef struct R300USEntry {
+    R300USKey key;
+    char *msl;
+    uint32_t id;
+    bool ow_ar;
+    struct R300USEntry *next;
+} R300USEntry;
+
+#define R300_US_BUCKETS 1024
+static R300USEntry *us_cache[R300_US_BUCKETS];
+static uint32_t us_cache_ids;
+
+static void us_key(R300USKey *k, const R300State *st, const R300FSDesc *desc)
+{
+    memset(k, 0, sizeof(*k));
+    k->config = r300_reg(st, US_CONFIG);
+    k->code_offset = r300_reg(st, US_CODE_OFFSET);
+    for (unsigned i = 0; i < 4; i++) {
+        k->code_addr[i] = r300_reg(st, US_CODE_ADDR_0 + 4 * i);
+        k->out_fmt[i] = r300_reg(st, US_OUT_FMT_0 + 4 * i);
+        k->colorpitch[i] = r300_reg(st, RB3D_COLORPITCH0 + 4 * i);
+    }
+    for (unsigned i = 0; i < R300_US_MAX_TEX; i++) {
+        k->tex_inst[i] = r300_reg(st, US_TEX_INST_0 + 4 * i);
+    }
+    for (unsigned i = 0; i < R300_US_MAX_ALU; i++) {
+        k->alu[0][i] = r300_reg(st, US_ALU_RGB_ADDR_0 + 4 * i);
+        k->alu[1][i] = r300_reg(st, US_ALU_ALPHA_ADDR_0 + 4 * i);
+        k->alu[2][i] = r300_reg(st, US_ALU_RGB_INST_0 + 4 * i);
+        k->alu[3][i] = r300_reg(st, US_ALU_ALPHA_INST_0 + 4 * i);
+    }
+    k->tx_enable = r300_reg(st, TX_ENABLE);
+    for (unsigned u = 0; u < 16; u++) {
+        k->tx_filter0[u] = r300_reg(st, TX_FILTER0_0 + 4 * u);
+        k->tx_format1[u] = r300_reg(st, TX_FORMAT1_0 + 4 * u);
+        /* only the endian swap of the offset reaches the text */
+        k->tx_swap[u] = r300_reg(st, TX_OFFSET_0 + 4 * u) & 3;
+    }
+    k->cctl = r300_reg(st, RB3D_CCTL);
+    k->clip_cntl = r300_reg(st, VAP_CLIP_CNTL);
+    k->desc = *desc;
+}
+
+static uint32_t us_key_hash(const R300USKey *k)
+{
+    const uint32_t *w = (const uint32_t *)k;
+    uint64_t h = 0x9E3779B97F4A7C15ull, a = 0, b = 0, c = 0;
+    size_t n = sizeof(*k) / 4, i = 0;
+
+    /* four independent lanes, so the multiplies overlap */
+    for (; i + 4 <= n; i += 4) {
+        h = (h ^ w[i]) * 0xFF51AFD7ED558CCDull;
+        a = (a ^ w[i + 1]) * 0xC4CEB9FE1A85EC53ull;
+        b = (b ^ w[i + 2]) * 0xFF51AFD7ED558CCDull;
+        c = (c ^ w[i + 3]) * 0xC4CEB9FE1A85EC53ull;
+    }
+    for (; i < n; i++) {
+        h = (h ^ w[i]) * 0xFF51AFD7ED558CCDull;
+    }
+    h ^= a ^ (b << 1) ^ (c << 2);
+    h ^= h >> 33;
+    return (uint32_t)(h ^ (h >> 29));
+}
+
+const char *r300_us_msl_cached(const R300State *st, const R300FSDesc *desc,
+                               uint32_t *id, bool *ow_ar, const char **err)
+{
+    R300USKey key;
+    R300USEntry **bucket, *e;
+
+    _Static_assert(sizeof(R300USKey) % 4 == 0, "key hashed as words");
+    us_key(&key, st, desc);
+    bucket = &us_cache[us_key_hash(&key) % R300_US_BUCKETS];
+    for (e = *bucket; e; e = e->next) {
+        if (!memcmp(&e->key, &key, sizeof(key))) {
+            *id = e->id;
+            *ow_ar = e->ow_ar;
+            *err = NULL;
+            return e->msl;
+        }
+    }
+
+    char *msl = r300_us_to_msl(st, desc, err);
+    if (!msl) {
+        return NULL;
+    }
+    e = calloc(1, sizeof(*e));
+    if (!e) {
+        free(msl);
+        *err = "out of memory";
+        return NULL;
+    }
+    e->key = key;
+    e->msl = msl;
+    e->id = ++us_cache_ids;
+    e->ow_ar = strstr(msl, "ow = ar") != NULL;
+    e->next = *bucket;
+    *bucket = e;
+    *id = e->id;
+    *ow_ar = e->ow_ar;
+    return msl;
+}
+
 char *r300_us_disasm(const R300State *st)
 {
     USNode nodes[4];

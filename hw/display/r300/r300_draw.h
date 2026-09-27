@@ -161,7 +161,9 @@ typedef struct R300DrawPacket {
     float aa_pos[6][2];
 
     /* Fragment stage */
-    char *msl;                  /* library source; owned by the packet */
+    const char *msl;            /* library source; owned by the US cache */
+    uint32_t msl_id;            /* unique per distinct msl */
+    bool msl_ow_ar;             /* the program writes W from alpha */
     R300FSUniforms uniforms;
     R300TexDesc tex[R300_NUM_TEX_UNITS];
 
@@ -205,7 +207,8 @@ void r300_load_vbpntr(R300Arrays *arr, const uint32_t *d, uint32_t ndw);
  * Build a draw from a 3D_DRAW_VBUF_2 (0x34), 3D_DRAW_IMMD_2 (0x35) or
  * 3D_DRAW_INDX_2 (0x36) body.  Returns false (with *err) when the draw
  * cannot be assembled at all; smaller omissions are flagged in pkt->warn.
- * On success the caller owns pkt->msl and pkt->verts (r300_draw_free).
+ * On success the caller owns pkt->verts (r300_draw_free); pkt->msl
+ * belongs to the translation cache and stays valid.
  */
 bool r300_draw_build(const R300State *st, const R300Arrays *arr,
                      uint32_t opcode, const uint32_t *d, uint32_t ndw,
