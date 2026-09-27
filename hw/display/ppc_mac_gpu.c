@@ -71,6 +71,24 @@ static BlitPathStats g_blit_stats;
  * reverse-engineered and several of them do real per-draw work (CRC scans,
  * VRAM probes, register audits), so they stay off unless asked for.
  */
+/*
+ * TRACE_ON(name): whether trace variable name is set. Each call site keeps
+ * its answer and asks getenv() again only after `qom-set ... trace` has
+ * changed something (g_trace_gen), because several of these sit on paths
+ * that run for every MMIO read, write-back or vertex, and getenv() walks
+ * the whole environment.
+ */
+static unsigned g_trace_gen = 1;
+#define TRACE_ON(name) ({                                   \
+    static unsigned trace_gen_;                             \
+    static bool trace_on_;                                  \
+    if (trace_gen_ != g_trace_gen) {                        \
+        trace_on_ = getenv(name) != NULL;                   \
+        trace_gen_ = g_trace_gen;                           \
+    }                                                       \
+    trace_on_;                                              \
+})
+
 static bool gpu_diag_on(void)
 {
     static int on = -1;
@@ -1553,8 +1571,8 @@ static void ppc_mac_gpu_display_update(void *opaque)
 
     /* Phase D — Post-present tile range check: sample the window texture
      * range every 200 frames (after boot) to detect late population by
-     * direct guest CPU writes. */
-    {
+     * direct guest CPU writes.  Bring-up diagnostic: PPCGPU_DIAG. */
+    if (gpu_diag_on()) {
         static int phase_d_frame = 0;
         phase_d_frame++;
         if (phase_d_frame == 500 || phase_d_frame == 700 ||
@@ -1674,8 +1692,9 @@ static void ppc_mac_gpu_display_update(void *opaque)
      *
      * We scan MULTIPLE potential RT offsets since the compositor
      * offset varies per session (0x300000, 0x900000, 0x940000, etc.)
+     * Bring-up diagnostic: PPCGPU_DIAG.
      */
-    {
+    if (gpu_diag_on()) {
         static uint32_t trap_frame = 0;
         static uint32_t prev_fb_crc = 0;
         static uint32_t prev_rt_crcs[4] = {0};
@@ -1813,8 +1832,9 @@ static void ppc_mac_gpu_display_update(void *opaque)
      * it's NOT running.
      *
      * Also sample at the OLD position for comparison.
+     * Bring-up diagnostic: PPCGPU_DIAG.
      */
-    if (s->renderer && s->renderer->get_drag_state) {
+    if (gpu_diag_on() && s->renderer && s->renderer->get_drag_state) {
         static uint32_t prev_diag_ox = 0, prev_diag_oy = 0;
         static uint32_t prev_diag_gen = 0;
         static bool prev_diag_valid = false;
@@ -1974,7 +1994,7 @@ static void ppc_mac_gpu_scratch_writeback_val(PPCMacGPUState *s, int reg_idx,
      * POWEREMU_WB_BE=1 restores the old order for comparison.
      */
     uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
-    uint32_t wire_val = getenv("POWEREMU_WB_BE") ? cpu_to_be32(wb_val)
+    uint32_t wire_val = TRACE_ON("POWEREMU_WB_BE") ? cpu_to_be32(wb_val)
                                                  : cpu_to_le32(wb_val);
 
     if (ppc_mac_gpu_gart_translate(s, wb_addr, &phys) ||
@@ -2020,7 +2040,7 @@ static void ppc_mac_gpu_rptr_writeback(PPCMacGPUState *s)
         return;                       /* nowhere to write, or the guest said not to */
     }
     uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
-    uint32_t wire_val = getenv("POWEREMU_WB_BE")
+    uint32_t wire_val = TRACE_ON("POWEREMU_WB_BE")
         ? cpu_to_be32(s->regs.cp_rb_rptr) : cpu_to_le32(s->regs.cp_rb_rptr);
 
     if (!ppc_mac_gpu_gart_translate(s, addr, &phys) &&
@@ -3157,9 +3177,11 @@ static bool ppc_mac_gpu_r300_packet3(PPCMacGPUState *s, uint32_t opcode,
         fprintf(s->r3_dump, "\n");
         fflush(s->r3_dump);
     }
-    if (s->r3->draws && s->r3_trace_lines < 40000) {
+    /* Only into an R300_DUMP file: on stderr this was up to 40000
+     * unbuffered writes, one per packet, in every normal run. */
+    if (s->r3_dump && s->r3->draws && s->r3_trace_lines < 40000) {
         s->r3_trace_lines++;
-        fprintf(s->r3_dump ? s->r3_dump : stderr, "T3 %02x n=%u %08x %08x\n", opcode,
+        fprintf(s->r3_dump, "T3 %02x n=%u %08x %08x\n", opcode,
                 body_dw, body_dw ? d[0] : 0, body_dw > 1 ? d[1] : 0);
     }
     if (!draw && r300_drawlog()) {
@@ -3645,7 +3667,7 @@ static inline uint32_t gmc_dst_bpp(uint32_t gmc)
     /* POWEREMU_TEX_TRACE: each 2D pixel format the guest asks for, once,
      * to find where a program's video frames really go (Halo's logos come
      * out green and magenta, and they are not 3D textures). */
-    if (getenv("POWEREMU_TEX_TRACE")) {
+    if (TRACE_ON("POWEREMU_TEX_TRACE")) {
         static uint32_t seen_2d;
         uint32_t dt = (gmc >> 8) & 0xF;
         if (!(seen_2d & (1u << dt))) {
@@ -5639,7 +5661,7 @@ static void r200_decode_tex_unit(PPCMacGPUState *s, int n, R200TexUnit *t)
      * YUV 4:2:2 (the backend applies it).  VRAM already holds the CPU's
      * byte order, which is what 16/32-bit texel decoding expects. */
     t->swap = offset & 3;
-    if (getenv("POWEREMU_TEX_TRACE")) {          /* every texture format, once */
+    if (TRACE_ON("POWEREMU_TEX_TRACE")) {          /* every texture format, once */
         static uint32_t seen_tex;
         if (t->format < 32 && !(seen_tex & (1u << t->format))) {
             seen_tex |= 1u << t->format;
@@ -5649,7 +5671,7 @@ static void r200_decode_tex_unit(PPCMacGPUState *s, int n, R200TexUnit *t)
     }
     /* POWEREMU_YUV_TRACE: what a YUV texture really holds, to tell the
      * 4:2:2 orderings apart (Tiger's welcome movie vs Halo's logos). */
-    if ((t->format == 10 || t->format == 11) && getenv("POWEREMU_YUV_TRACE")) {
+    if ((t->format == 10 || t->format == 11) && TRACE_ON("POWEREMU_YUV_TRACE")) {
         static int yuv_raw_logged;
         if (yuv_raw_logged++ < 12) {
             uint32_t o = offset & ~0x1Fu;
@@ -5707,7 +5729,7 @@ static void r200_decode_tex_unit(PPCMacGPUState *s, int n, R200TexUnit *t)
         }
         /* POWEREMU_YUV_TRACE: the frame's own bytes, from the middle row,
          * which say which 4:2:2 order a program really uses. */
-        if ((t->format == 10 || t->format == 11) && getenv("POWEREMU_YUV_TRACE")) {
+        if ((t->format == 10 || t->format == 11) && TRACE_ON("POWEREMU_YUV_TRACE")) {
             /* Log each new kind of frame, not just the first ones: a game
              * plays several videos and only some come out wrong. */
             static uint64_t last_kind;
@@ -6093,7 +6115,7 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
     if (vertex_program) {
         static uint32_t last_cntl[2];
         uint32_t c1 = R3D(0x22D0), c2 = R3D(0x22D4);
-        if ((c1 != last_cntl[0] || c2 != last_cntl[1]) && getenv("POWEREMU_VP_TRACE")) {
+        if ((c1 != last_cntl[0] || c2 != last_cntl[1]) && TRACE_ON("POWEREMU_VP_TRACE")) {
             uint32_t first = c1 & 0x3FF, last = (c1 >> 20) & 0x3FF;
             last_cntl[0] = c1; last_cntl[1] = c2;
             fprintf(stderr, "ppc-mac-gpu vp inputs: fmt0=0x%08x fmt1=0x%08x arrays=%u "
@@ -6554,7 +6576,7 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
                 st.out_tex[t][3] = 1.0f;
             }
             ppc_mac_gpu_vp_run(&st, vp_prog, vp_count);
-            if (getenv("POWEREMU_VP_TRACE")) {
+            if (TRACE_ON("POWEREMU_VP_TRACE")) {
                 static int shown; static uint32_t shown_for;
                 if (vp_count != shown_for) { shown_for = vp_count; shown = 0; }
                 if (shown++ < 3) {
@@ -6913,7 +6935,7 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
                     tl[j].off = u->offset; tl[j].key = key; tl[j].crc = crc;
                 }
                 static int ndump;
-                if (getenv("PPCGPU_TEXDUMP") && ndump < 600 &&
+                if (TRACE_ON("PPCGPU_TEXDUMP") && ndump < 600 &&
                     (u->format != 6 || u->host_data) &&
                     u->pitch * u->height <= 4 * 1024 * 1024 &&
                     (u->host_data || u->offset + (uint64_t)u->pitch * u->height
@@ -9046,7 +9068,7 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
      * for something; this says what it touched on the way in, and what it
      * keeps touching while stuck.
      */
-    if (getenv("POWEREMU_STALL_TRACE")) {
+    if (TRACE_ON("POWEREMU_STALL_TRACE")) {
         static struct { uint32_t addr, val; bool wr; } ring[256];
         static unsigned n;
         static int64_t last_draw_seen;
@@ -9147,7 +9169,7 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
      * this says which -- Halo's title screen draws and then stops, with its
      * sound looping, so something it waits for never arrives.
      */
-    if (getenv("POWEREMU_POLL_TRACE")) {
+    if (TRACE_ON("POWEREMU_POLL_TRACE")) {
         static uint32_t count[0x4000 / 4];
         static int64_t next_report;
         int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
@@ -9678,7 +9700,7 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
     case R200_SCRATCH_REG0 ... R200_SCRATCH_REG5: {
         int scratch_idx = (addr - R200_SCRATCH_REG0) / 4;
         val = s->regs.scratch_reg[scratch_idx];
-        if (getenv("POWEREMU_FENCE_TRACE")) {
+        if (TRACE_ON("POWEREMU_FENCE_TRACE")) {
             static uint32_t last[6] = { 0xFFFFFFFF }; static int n;
             if (val != last[scratch_idx] && n++ < 40) {
                 last[scratch_idx] = val;
@@ -10090,7 +10112,7 @@ static void ppc_mac_gpu_tcl_port_write(PPCMacGPUState *s, hwaddr addr,
         s->regs.tcl_scalar_stride = (val >> 16) & 0xff;
         break;
     case 0x220C:    /* SE_TCL_SCALAR_DATA_REG */
-        if (getenv("POWEREMU_VP_TRACE")) {
+        if (TRACE_ON("POWEREMU_VP_TRACE")) {
             static uint8_t seen_scalar[0x200];
             uint32_t sa = s->regs.tcl_scalar_addr & 0x1ff;
             if (!seen_scalar[sa]) {
@@ -11984,6 +12006,7 @@ static void ppc_mac_gpu_set_trace(Object *obj, const char *value, Error **errp)
     }
     /* Logs that remember whether they were switched on have to be told. */
     g_seq_log_enabled = -1;
+    g_trace_gen++;
     fprintf(stderr, "ppc-mac-gpu: %s %s\n", name, off ? "off" : "on");
 }
 
