@@ -6549,25 +6549,70 @@ static void r200_note_written(uint64_t lo, uint64_t hi, const R200TexKey *key)
     g_r200_nwritten++;
 }
 
-/* VRAM ranges read (as textures) by draws in the open or in-flight batches. */
-#define R200_MAX_READ 64
-static struct { uint64_t lo, hi; } g_r200_read[R200_MAX_READ];
-static int g_r200_nread;
-static bool g_r200_read_overflow;
+/*
+ * Card addresses read (as textures) by draws in the open or in-flight
+ * batches, as a bitmap of 4 KB pages over the 32-bit address space.  It
+ * was a list of 64 ranges that, once full, made every draw look like a
+ * hazard: Quake binds more textures than that a frame, and each of its
+ * draws then waited for the GPU (18% of the vCPU).  Only the words set
+ * since the last flush are cleared.
+ */
+#define R200_READ_SHIFT 12
+#define R200_READ_WORDS ((1ull << (32 - R200_READ_SHIFT)) / 64)
+static uint64_t g_r200_readmap[R200_READ_WORDS];
+static uint32_t g_r200_read_w0 = R200_READ_WORDS, g_r200_read_w1;  /* words set */
+
+static void r200_read_pages(uint64_t lo, uint64_t hi, uint64_t *p0, uint64_t *p1)
+{
+    hi = MIN(hi, 1ull << 32);
+    *p0 = lo >> R200_READ_SHIFT;
+    *p1 = (hi - 1) >> R200_READ_SHIFT;
+}
 
 static void r200_note_read(uint64_t lo, uint64_t hi)
 {
-    for (int i = 0; i < g_r200_nread; i++) {
-        if (g_r200_read[i].lo == lo && g_r200_read[i].hi == hi) {
-            return;
-        }
-    }
-    if (g_r200_nread == R200_MAX_READ) {
-        g_r200_read_overflow = true;         /* be conservative */
+    uint64_t p0, p1;
+
+    if (hi <= lo || lo >= 1ull << 32) {
         return;
     }
-    g_r200_read[g_r200_nread].lo = lo;
-    g_r200_read[g_r200_nread++].hi = hi;
+    r200_read_pages(lo, hi, &p0, &p1);
+    for (uint64_t p = p0; p <= p1; p++) {
+        g_r200_readmap[p / 64] |= 1ull << (p % 64);
+    }
+    g_r200_read_w0 = MIN(g_r200_read_w0, (uint32_t)(p0 / 64));
+    g_r200_read_w1 = MAX(g_r200_read_w1, (uint32_t)(p1 / 64 + 1));
+}
+
+/* Whether any page of [lo, hi) is read by the open or in-flight batches. */
+static bool r200_range_read(uint64_t lo, uint64_t hi)
+{
+    uint64_t p0, p1;
+
+    if (hi <= lo || lo >= 1ull << 32 || g_r200_read_w0 >= g_r200_read_w1) {
+        return false;
+    }
+    r200_read_pages(lo, hi, &p0, &p1);
+    p0 = MAX(p0, (uint64_t)g_r200_read_w0 * 64);
+    p1 = MIN(p1, (uint64_t)g_r200_read_w1 * 64 - 1);
+    for (uint64_t p = p0; p <= p1; ) {
+        uint64_t w = g_r200_readmap[p / 64] >> (p % 64);
+        if (w && (p1 - p >= 63 || (w & ((2ull << (p1 - p)) - 1)))) {
+            return true;
+        }
+        p += 64 - p % 64;
+    }
+    return false;
+}
+
+static void r200_reads_clear(void)
+{
+    if (g_r200_read_w0 < g_r200_read_w1) {
+        memset(g_r200_readmap + g_r200_read_w0, 0,
+               (g_r200_read_w1 - g_r200_read_w0) * sizeof(uint64_t));
+    }
+    g_r200_read_w0 = R200_READ_WORDS;
+    g_r200_read_w1 = 0;
 }
 
 static bool metal_range_busy_r200(void *opaque, uint64_t lo, uint64_t hi,
@@ -6581,17 +6626,7 @@ static bool metal_range_busy_r200(void *opaque, uint64_t lo, uint64_t hi,
             return true;
         }
     }
-    if (write_access) {
-        if (g_r200_read_overflow) {
-            return true;
-        }
-        for (int i = 0; i < g_r200_nread; i++) {
-            if (lo < g_r200_read[i].hi && g_r200_read[i].lo < hi) {
-                return true;
-            }
-        }
-    }
-    return false;
+    return write_access && r200_range_read(lo, hi);
 }
 
 static bool r200_batch_conflict(uint64_t lo, uint64_t hi, const R200TexKey *same)
@@ -6703,8 +6738,7 @@ static bool metal_flush_r200(void *opaque)
     [g_r200_inflight release];
     g_r200_inflight = nil;
     g_r200_nwritten = 0;
-    g_r200_nread = 0;
-    g_r200_read_overflow = false;
+    r200_reads_clear();
     g_r200_stat_flushes++;
     g_r200_stat_flush_us += g_get_monotonic_time() - t0;
     return true;
@@ -7525,28 +7559,8 @@ static id<MTLSamplerState> r300_sampler(id<MTLDevice> dev, uint32_t f0,
  */
 static bool r300_read_conflict(uint64_t lo, uint64_t hi, const R200TexKey *rt)
 {
-    if (g_r200_enc && !memcmp(&g_r200_enc_key, rt, sizeof(*rt)) &&
-        !g_r200_read_overflow) {
-        bool any = false;
-        for (int i = 0; i < g_r200_nread; i++) {
-            if (lo < g_r200_read[i].hi && g_r200_read[i].lo < hi) {
-                any = true;
-                break;
-            }
-        }
-        if (!any) {
-            return false;
-        }
-    }
-    if (g_r200_read_overflow) {
-        return g_r200_cb != nil;
-    }
-    for (int i = 0; i < g_r200_nread; i++) {
-        if (lo < g_r200_read[i].hi && g_r200_read[i].lo < hi) {
-            return true;
-        }
-    }
-    return false;
+    (void)rt;       /* the same target conflicts too if it is sampled */
+    return r200_range_read(lo, hi);
 }
 
 /* Metal format of a colour-buffer view (R300_RTV_*). */
