@@ -18,8 +18,19 @@ release. [QemuMac](https://github.com/matthewdeaves/QemuMac) builds it
 | AGP capability and GART on the host bridge | `hw/pci-host/uninorth.c` |
 | Screamer sound | `hw/audio/screamer.c`, `hw/misc/macio/macio.c` |
 | Cocoa: window sized to the guest, no crash on guest shutdown | `ui/cocoa.m` |
-| PowerPC: host-FPU fast path, inline FPRF, inline lmw/stmw | `target/ppc/` |
+| PowerPC: host-FPU fast path, inline FPRF, inline lmw/stmw, inline lfs/stfs conversion | `target/ppc/` |
 | Offline tests for the 3D translation | `tests/r300/` |
+
+More performance work on the card: the texture cache now validates per-page
+against VRAM write generation (rehash only the pages a bound texture actually
+had written, not the whole chain), per-draw Metal lookups (pixel-format
+alignment, sampler states, texture cache scan) are cached instead of
+recomputed, a repeated vertex index is transformed once per draw instead of
+once per occurrence, and the vertex-program interpreter decodes each
+instruction once per draw instead of once per vertex (~2x on the
+interpreter). 2D blits from system RAM go a page at a time. Bring-up and
+rate logging are off by default; set `PPCGPU_DIAG`, `PPCGPU_RATE` or
+`R300_DRAWLOG` to get them back.
 
 The device sources came from
 [linuxkid473/poweremu-qemu](https://github.com/linuxkid473/poweremu-qemu) (branch
