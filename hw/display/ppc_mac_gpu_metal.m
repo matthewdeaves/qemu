@@ -79,6 +79,7 @@ void *ppc_mac_gpu_metal_alloc_vram(uint64_t vram_size, void **opaque_out)
         if (!buf) {
             qemu_log("ppc-mac-gpu-metal: MTLBuffer alloc failed (%llu bytes)\n",
                      (unsigned long long)vram_size);
+            [dev release];
             return NULL;
         }
 
@@ -430,6 +431,8 @@ static id<MTLRenderPipelineState> metal_get_blend_pipeline(
         id<MTLFunction> vertexFunc = [st->shaderLibrary newFunctionWithName:@"vertex_main"];
         id<MTLFunction> fragmentFunc = [st->shaderLibrary newFunctionWithName:@"fragment_textured"];
         if (!vertexFunc || !fragmentFunc) {
+            [vertexFunc release];
+            [fragmentFunc release];
             return st->pipelineState;
         }
 
@@ -439,6 +442,8 @@ static id<MTLRenderPipelineState> metal_get_blend_pipeline(
         pipeDesc.fragmentFunction = fragmentFunc;
         pipeDesc.vertexDescriptor = st->vertexDescriptor;
         pipeDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        [vertexFunc release];       /* the descriptor holds them now */
+        [fragmentFunc release];
 
         MTLBlendFactor mtl_src = r200_to_mtl_blend(src_blend);
         MTLBlendFactor mtl_dst = r200_to_mtl_blend(dst_blend);
@@ -461,6 +466,7 @@ static id<MTLRenderPipelineState> metal_get_blend_pipeline(
         NSError *error = nil;
         id<MTLRenderPipelineState> pipeline =
             [st->device newRenderPipelineStateWithDescriptor:pipeDesc error:&error];
+        [pipeDesc release];
         if (!pipeline) {
             qemu_log("METAL: blend pipeline creation failed for src=0x%x dst=0x%x: %s\n",
                      src_blend, dst_blend,
@@ -475,6 +481,7 @@ static id<MTLRenderPipelineState> metal_get_blend_pipeline(
             st->blend_cache_count++;
         } else {
             /* Evict oldest */
+            [st->blend_cache[0].pipeline release];
             st->blend_cache[0].pipeline = nil;
             memmove(&st->blend_cache[0], &st->blend_cache[1],
                     (BLEND_CACHE_SIZE - 1) * sizeof(BlendCacheEntry));
@@ -1095,6 +1102,9 @@ static void *metal_init(uint8_t *vram_ptr, uint64_t vram_size)
                           error ? [[error localizedDescription] UTF8String] : "unknown");
             /* Non-fatal: fall back to main pipeline */
         }
+        [pipeDesc release];
+        [vertexFunc release];
+        [fragmentFunc release];
 
         /* Save library + vertex descriptor for creating blend pipelines on demand */
         st->shaderLibrary = library;
@@ -1112,6 +1122,7 @@ static void *metal_init(uint8_t *vram_ptr, uint64_t vram_size)
         sampDesc.minFilter = MTLSamplerMinMagFilterLinear;
         sampDesc.magFilter = MTLSamplerMinMagFilterLinear;
         st->samplerBilinear = [st->device newSamplerStateWithDescriptor:sampDesc];
+        [sampDesc release];
 
         /* Create 1x1 opaque white dummy texture for non-textured draws.
          * The shader always does tex.sample() * vertex_color, so binding
@@ -3412,9 +3423,12 @@ static int metal_draw_3d(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                 }
             }
 
-            texture = metal_texture_from_vram(st, tx_offset,
-                                               tx_width, tx_height,
-                                               tx_pitch, tx_format);
+            /* +1 from the helper; the pool drops it once the command
+             * buffer, which retains what it binds, has been committed. */
+            texture = [metal_texture_from_vram(st, tx_offset,
+                                                tx_width, tx_height,
+                                                tx_pitch, tx_format)
+                       autorelease];
 
             /* Track: texture sampled */
             frame_tracker_record(&st->frame_tracker, PASS_EVENT_SAMPLE_TEX,
@@ -3548,7 +3562,7 @@ static int metal_draw_3d(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
          * window content). Log EVERY draw in this range regardless of
          * existing TEX_PROBE dedup. */
         if (draw_num >= 42 && draw_num <= 69) {
-            const char *role = "unknown";
+            const char *role;
             if (!textured && nop_blend) role = "clear/fill";
             else if (!textured) role = "solid_quad";
             else if (src_blend == R200_BLEND_GL_ONE &&
