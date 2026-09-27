@@ -7367,6 +7367,27 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
                 uint64_t h = len ? r300_hash(src + off, len) : 0;
                 if (h != g_r300_tcache[hit].page_hash[i]) {
                     all_unchanged = false;
+                } else if (r200_diag_on()) {
+                    /* qemu#2: characterise the pages Quake II's driver
+                     * rewrites with identical bytes every frame. */
+                    static int texwatch_log = 0;
+                    if (texwatch_log < 500) {
+                        uint32_t lvl = 0;
+                        for (uint32_t l = 1; l < td->levels &&
+                             l < R300_TEX_MAX_LEVELS; l++) {
+                            if (off >= td->lvl_off[l]) {
+                                lvl = l;
+                            }
+                        }
+                        texwatch_log++;
+                        fprintf(stderr, "[TEXWATCH] addr=%06x page=%u/%u "
+                                "off=%llu len=%llu lvl=%u/%u %ux%u fmt=%u "
+                                "pitch=%u unchanged-rewrite\n", td->gpu_addr,
+                                i, td->npages, (unsigned long long)off,
+                                (unsigned long long)len, lvl, td->levels,
+                                td->width, td->height, td->format,
+                                td->pitch_bytes);
+                    }
                 }
                 /*
                  * Verified at gen_now, never at pg: pg may be
