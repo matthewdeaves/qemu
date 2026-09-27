@@ -2636,6 +2636,15 @@ static void r300_drawlog_draw(PPCMacGPUState *s, uint32_t opcode,
             r300_reg(r, 0x4E0C), r300_reg(r, 0x4BD4), r300_reg(r, 0x4104),
             r300_reg(r, 0x4020), r300_reg(r, 0x4010), r300_reg(r, 0x4014),
             r300_reg(r, 0x4E88), r300_reg(r, 0x46A4));
+    if (r300_reg(r, 0x4BC0) & 1) {   /* FG_FOG_BLEND.ENABLE */
+        uint32_t sc = r300_reg(r, 0x4294), of = r300_reg(r, 0x4298);
+        float fsc, fof;
+
+        memcpy(&fsc, &sc, 4);
+        memcpy(&fof, &of, 4);
+        fprintf(f, " fog=%x/%x/%g/%g", r300_reg(r, 0x4BC0),
+                r300_reg(r, 0x401C), fsc, fof);
+    }
     for (int t = 0; t < 16; t++) {
         if (r300_reg(r, 0x4104) & (1u << t)) {
             fprintf(f, " t%d=%08x/%08x/%08x/%08x/%08x", t,
