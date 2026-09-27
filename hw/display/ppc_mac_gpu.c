@@ -2587,6 +2587,55 @@ static uint32_t r300_vram_write_gen(PPCMacGPUState *s, uint64_t addr, uint64_t l
     return gen;
 }
 
+/*
+ * Per-page refinement of r300_vram_write_gen(), for textures the renderer
+ * can rehash a page at a time instead of all at once (a mipmapped 256x256
+ * texture in Quake II: a few dirty pages inside ~330 KB, 9% self / 15%
+ * inclusive of the vCPU spent re-hashing the whole thing on every bind).
+ * Leaves td->npages at 0 (its memset default) — meaning "not available,
+ * use write_gen instead" — when the chain is too big to track this way or
+ * is already a private host_data copy with nothing in VRAM to watch.
+ */
+static void r300_tex_fill_page_gen(PPCMacGPUState *s, R300TexDesc *td)
+{
+    ram_addr_t ram;
+    uint64_t addr = td->gpu_addr, len = td->size_bytes;
+    uint64_t first_page, last_page, n;
+
+    if (!len || addr >= s->vram_size) {
+        return;
+    }
+    len = MIN(len, s->vram_size - addr);
+    first_page = addr >> 12;
+    last_page = (addr + len - 1) >> 12;
+    n = last_page - first_page + 1;
+    if (n > R300_TEX_HASH_MAX_PAGES) {
+        return;
+    }
+
+    ram = memory_region_get_ram_addr(&s->vram);
+    /*
+     * gen_now is read before any page below is inspected, so it is a
+     * lower bound on the fold clock at hash time: r300_texture_full()
+     * records a page it hashes as verified at gen_now, not at page_gen[i]
+     * (which may be UINT32_MAX, meaning "dirty right now" — a value that
+     * must never compare as "unchanged" again).  Any write landing after
+     * this point either is still dirty at the next check (page_gen ==
+     * UINT32_MAX, always rehashed) or gets folded to a generation
+     * s->vram_gen was bumped past gen_now to produce, so it always
+     * compares greater than a verified gen_now.  Either way the page is
+     * correctly seen as changed.
+     */
+    td->gen_now = s->vram_gen;
+    for (uint64_t i = 0; i < n; i++) {
+        uint64_t p = first_page + i;
+        td->page_gen[i] = physical_memory_get_dirty_flag(ram + (p << 12),
+                                                          DIRTY_MEMORY_VGA)
+                          ? UINT32_MAX : s->vram_page_gen[p];
+    }
+    td->npages = (uint16_t)n;
+}
+
 /* Fold the VRAM dirty log into the page generations (r300_vram_write_gen). */
 static void r300_vram_fold(PPCMacGPUState *s)
 {
@@ -3112,6 +3161,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
             R300TexDesc *td = &pkt.tex[t];
             if (td->bound && !td->host_data) {
                 td->write_gen = r300_vram_write_gen(s, td->gpu_addr, td->size_bytes);
+                r300_tex_fill_page_gen(s, td);
             }
         }
 

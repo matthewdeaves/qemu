@@ -7176,9 +7176,39 @@ static struct {
     uint32_t gen;                   /* VRAM write generation it was checked at */
     id<MTLTexture> tex;
     uint64_t used;
+    /* Per-page recheck (see r300_texture_full): npages > 0 mirrors the
+     * R300TexDesc that built this entry.  page_hash[i] is the hash of
+     * page i's bytes as of page_vgen[i], the fold clock (td->gen_now) at
+     * the time that page was last actually hashed.  Heap-allocated
+     * (npages can reach R300_TEX_HASH_MAX_PAGES = 128) and freed/resized
+     * whenever a slot is reused for a texture of a different page count. */
+    uint64_t *page_hash;
+    uint32_t *page_vgen;
+    uint16_t npages;
 } g_r300_tcache[R300_TCACHE];
 static uint8_t g_r300_tcache_hint[256];    /* slot by address, see r300_texture_full */
 static uint64_t g_r300_tcache_clock;
+
+/*
+ * Byte span of texture page i (VRAM page (td->gpu_addr >> 12) + i, the
+ * same indexing r300_tex_fill_page_gen() used to fill td->page_gen)
+ * within the texture's own byte range, as an offset from src (0-based)
+ * and a length — clipped to [gpu_addr, gpu_addr + size_bytes) since the
+ * texture's first and last pages are usually only partly covered.
+ */
+static void r300_tex_page_span(const R300TexDesc *td, uint32_t i,
+                               uint64_t *off, uint64_t *len)
+{
+    uint64_t page_start = ((uint64_t)(td->gpu_addr >> 12) + i) << 12;
+    uint64_t page_end = page_start + 4096;
+    uint64_t tex_start = td->gpu_addr;
+    uint64_t tex_end = tex_start + td->size_bytes;
+    uint64_t start = MAX(page_start, tex_start);
+    uint64_t end = MIN(page_end, tex_end);
+
+    *off = start - tex_start;
+    *len = end > start ? end - start : 0;
+}
 
 /* One face/slice of one level as the Metal format wants it (tight rows). */
 static uint8_t *r300_level_bytes(const R300TexDesc *td, const uint8_t *src,
@@ -7263,6 +7293,7 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
     bool known = !td->host_data && td->write_gen;
     uint64_t hash = 0;
     bool hashed = false;
+    bool pages_fresh = false;   /* g_r300_tcache[lru].page_hash/vgen already current */
     int lru = 0, hit = -1;
     /* Where this address was last found: a draw's textures are usually
      * the previous draw's, and the scan below is 256 compares. */
@@ -7285,16 +7316,55 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
             g_r300_tcache[hit].used = ++g_r300_tcache_clock;
             return g_r300_tcache[hit].tex;
         }
-        hash = r300_hash(src, td->size_bytes);
-        hashed = true;
-        if (g_r300_tcache[hit].hash == hash) {
-            g_r300_tcache[hit].gen = td->write_gen;
-            g_r300_tcache[hit].used = ++g_r300_tcache_clock;
-            return g_r300_tcache[hit].tex;
+
+        if (td->npages > 0 && g_r300_tcache[hit].npages == td->npages) {
+            /*
+             * Per-page recheck: hash only the pages that might have
+             * changed since they were last verified, instead of the
+             * whole chain (9% self / 15% inclusive of the vCPU in
+             * Quake II, re-hashing a handful of dirty pages inside a
+             * ~330 KB mipmapped texture on every bind).
+             */
+            bool all_unchanged = true;
+            for (uint32_t i = 0; i < td->npages; i++) {
+                uint32_t pg = td->page_gen[i];
+                if (pg != UINT32_MAX && pg <= g_r300_tcache[hit].page_vgen[i]) {
+                    continue;   /* not written since we last verified it */
+                }
+                uint64_t off, len;
+                r300_tex_page_span(td, i, &off, &len);
+                uint64_t h = len ? r300_hash(src + off, len) : 0;
+                if (h != g_r300_tcache[hit].page_hash[i]) {
+                    all_unchanged = false;
+                }
+                /*
+                 * Verified at gen_now, never at pg: pg may be
+                 * UINT32_MAX (dirty right now), and using that as an
+                 * "unchanged since" watermark would make the page
+                 * compare clean forever.  See r300_tex_fill_page_gen().
+                 */
+                g_r300_tcache[hit].page_hash[i] = h;
+                g_r300_tcache[hit].page_vgen[i] = td->gen_now;
+            }
+            if (all_unchanged) {
+                g_r300_tcache[hit].gen = td->write_gen;
+                g_r300_tcache[hit].used = ++g_r300_tcache_clock;
+                return g_r300_tcache[hit].tex;
+            }
+            lru = hit;               /* same texture, new texels */
+            pages_fresh = true;      /* page_hash/page_vgen already current */
+        } else {
+            hash = r300_hash(src, td->size_bytes);
+            hashed = true;
+            if (g_r300_tcache[hit].hash == hash) {
+                g_r300_tcache[hit].gen = td->write_gen;
+                g_r300_tcache[hit].used = ++g_r300_tcache_clock;
+                return g_r300_tcache[hit].tex;
+            }
+            lru = hit;                /* same texture, new texels */
         }
-        lru = hit;                      /* same texture, new texels */
     }
-    if (!hashed) {
+    if (!hashed && td->npages == 0) {
         hash = r300_hash(src, td->size_bytes);
     }
 
@@ -7336,10 +7406,42 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
     [g_r300_tcache[lru].tex release];
     *hint = lru;
     g_r300_tcache[lru].key = key;
-    g_r300_tcache[lru].hash = hash;
     g_r300_tcache[lru].gen = known ? td->write_gen : 0;
     g_r300_tcache[lru].tex = t;
     g_r300_tcache[lru].used = ++g_r300_tcache_clock;
+
+    if (td->npages > 0) {
+        if (!pages_fresh) {
+            /* New slot, or one whose per-page arrays are for a texture of
+             * a different page count: (re)allocate and hash every page. */
+            if (g_r300_tcache[lru].npages != td->npages) {
+                g_free(g_r300_tcache[lru].page_hash);
+                g_free(g_r300_tcache[lru].page_vgen);
+                g_r300_tcache[lru].page_hash = g_new(uint64_t, td->npages);
+                g_r300_tcache[lru].page_vgen = g_new(uint32_t, td->npages);
+                g_r300_tcache[lru].npages = td->npages;
+            }
+            for (uint32_t i = 0; i < td->npages; i++) {
+                uint64_t off, len;
+                r300_tex_page_span(td, i, &off, &len);
+                g_r300_tcache[lru].page_hash[i] = len ? r300_hash(src + off, len) : 0;
+                g_r300_tcache[lru].page_vgen[i] = td->gen_now;
+            }
+        }
+        g_r300_tcache[lru].hash = 0;    /* unused while npages > 0 */
+    } else {
+        if (g_r300_tcache[lru].npages) {
+            g_free(g_r300_tcache[lru].page_hash);
+            g_free(g_r300_tcache[lru].page_vgen);
+            g_r300_tcache[lru].page_hash = NULL;
+            g_r300_tcache[lru].page_vgen = NULL;
+            g_r300_tcache[lru].npages = 0;
+        }
+        if (!hashed) {
+            hash = r300_hash(src, td->size_bytes);
+        }
+        g_r300_tcache[lru].hash = hash;
+    }
     return t;
 }
 

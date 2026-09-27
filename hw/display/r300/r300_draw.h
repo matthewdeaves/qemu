@@ -55,6 +55,13 @@ enum { R300_TEXDIM_2D = 0, R300_TEXDIM_3D = 1, R300_TEXDIM_CUBE = 2 };
 
 #define R300_TEX_MAX_LEVELS     12      /* 2048 .. 1 */
 
+/* Pages covered by the per-page write-generation snapshot below: 512 KB,
+ * enough for a mipmapped 256x256 texture (~330 KB) with room to spare.
+ * R300DrawPacket holds one R300TexDesc per unit (16) as a stack local
+ * that lives for a single draw, not copied or retained afterwards, so
+ * this only costs draw-call stack space, not persistent memory. */
+#define R300_TEX_HASH_MAX_PAGES 128
+
 typedef struct R300TexDesc {
     bool bound;
     uint32_t gpu_addr;          /* TX_OFFSET, low bits cleared */
@@ -85,6 +92,24 @@ typedef struct R300TexDesc {
      * before drawing (0: unknown): a cached copy checked at this
      * generation or later is still good without rehashing. */
     uint32_t write_gen;
+
+    /*
+     * Per-VRAM-page refinement of write_gen, set by the device before
+     * drawing, so the renderer's texture cache can rehash only the pages
+     * that may actually have changed instead of the whole chain.
+     * page_gen[i] is VRAM page (gpu_addr >> 12) + i: UINT32_MAX if that
+     * page is dirty right now (not yet folded), else its folded
+     * generation (s->vram_page_gen[]).  npages is 0 when this isn't
+     * available (chain longer than R300_TEX_HASH_MAX_PAGES, or a
+     * host_data texture copied out of the GART/AGP), meaning "use the
+     * whole-chain write_gen/hash path instead".  gen_now is the fold
+     * clock (s->vram_gen) at the moment page_gen was filled: see the
+     * comment in r300_texture_full() on why a page must be recorded as
+     * verified at gen_now, never at its own page_gen value.
+     */
+    uint32_t page_gen[R300_TEX_HASH_MAX_PAGES];
+    uint16_t npages;
+    uint32_t gen_now;
 } R300TexDesc;
 
 /* Width, height and depth (slices; 6 faces for a cube) of mip level l. */
