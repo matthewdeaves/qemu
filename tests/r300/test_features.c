@@ -317,6 +317,13 @@ static void rendering_completeness(void)
           "MRT outputs missing");
     r300_draw_free(&p);
     r300_state_write(&st, 0x4E00, 0);
+
+    /* COLOR_ENDIAN 0 ARGB8888 targets are stored swapped (r300_cb_swap32) */
+    r300_state_write(&st, 0x4E38, (6u << 21) | (0u << 19) | 64);      /* ARGB8888, no swap */
+    d = immd_pkt(13, 4, quad4, &n);
+    CHECK(r300_draw_build(&st, &none, 0x35, d, n, rd, NULL, &p, &err) &&
+          p.uniforms.rt_swap32 == 1, "COLOR_ENDIAN 0 target not stored swapped");
+    r300_draw_free(&p);
 }
 
 int main(void)
@@ -453,6 +460,22 @@ int main(void)
     /* The driver's own formula at a picked pixel (2 samples, 704 wide). */
     CHECK(r300_msaa_offset(592, 496, 2, 704, 4, 0) == 0x2b3400, "msaa sample 0 %x",
           r300_msaa_offset(592, 496, 2, 704, 4, 0));
+    /*
+     * What an ARGB8888 colour buffer stores must read back through the
+     * texture rule (TXO_ENDIAN 0: the big-endian dword) as the dword the
+     * card wrote, for COLOR_ENDIAN 2 (the desktop) and 0 (Quake's water
+     * warp, which came back channel-reversed: red water).
+     */
+    for (unsigned e = 0; e <= 2; e += 2) {
+        uint32_t dw = 0xAABBCCDDu, sw = dw;
+        unsigned mode = r300_cb_swap32(e);
+        if (mode == 2) {
+            sw = __builtin_bswap32(dw);
+        }
+        uint8_t b[4] = { sw, sw >> 8, sw >> 16, sw >> 24 };    /* stored little-endian */
+        uint32_t tex = (uint32_t)b[0] << 24 | b[1] << 16 | b[2] << 8 | b[3];
+        CHECK(tex == dw, "COLOR_ENDIAN %u reads back as %08x", e, tex);
+    }
     rendering_completeness();
     printf(fails ? "test_features: %d FAILED\n" : "test_features: PASS\n", fails);
     return fails != 0;

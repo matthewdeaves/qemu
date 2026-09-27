@@ -2483,7 +2483,7 @@ static void r300_cmask_clear(PPCMacGPUState *s)
         s->renderer->flush_r200(s->renderer_opaque);
     }
     if (bpp == 4) {
-        uint32_t w = r300_swap_mode(v, endian);
+        uint32_t w = r300_swap_mode(v, r300_cb_swap32(endian));
         for (uint64_t i = 0; i < bpr * rows; i += 4) {
             stl_le_p(vram + off + i, w);
         }
@@ -2557,7 +2557,7 @@ static void r300_drawlog_draw(PPCMacGPUState *s, uint32_t opcode,
     }
     fprintf(f, "D%llu op%02x vf=%08x n=%u rt=%08x/%08x zb=%x zs=%08x rm=%08x "
             "zf=%x zo=%08x zp=%08x bw=%x cull=%x pm=%x vte=%x vc=%x cb=%08x "
-            "ab=%08x cm=%x af=%x ten=%x aa=%x ms=%08x/%08x res=%x",
+            "ab=%08x cm=%x af=%x ten=%x aa=%x ms=%08x/%08x res=%x of=%08x",
             (unsigned long long)r->draws, opcode, body_dw ? d[0] : 0, body_dw,
             r300_reg(r, 0x4E28), r300_reg(r, 0x4E38), r300_reg(r, 0x4F00),
             r300_reg(r, 0x4F04), r300_reg(r, 0x4F08), r300_reg(r, 0x4F10),
@@ -2566,7 +2566,7 @@ static void r300_drawlog_draw(PPCMacGPUState *s, uint32_t opcode,
             r300_reg(r, 0x2140), r300_reg(r, 0x4E04), r300_reg(r, 0x4E08),
             r300_reg(r, 0x4E0C), r300_reg(r, 0x4BD4), r300_reg(r, 0x4104),
             r300_reg(r, 0x4020), r300_reg(r, 0x4010), r300_reg(r, 0x4014),
-            r300_reg(r, 0x4E88));
+            r300_reg(r, 0x4E88), r300_reg(r, 0x46A4));
     for (int t = 0; t < 16; t++) {
         if (r300_reg(r, 0x4104) & (1u << t)) {
             fprintf(f, " t%d=%08x/%08x/%08x/%08x/%08x", t,
@@ -2760,7 +2760,7 @@ static void r300_aa_resolve(PPCMacGPUState *s, const R300DrawPacket *pkt)
         /* The byte alpha lands in: the ARGB dword in COLOR_ENDIAN order,
          * stored little-endian (as 3D_CLEAR_CMASK writes it). */
         uint32_t amask = r300_swap_mode(0xFF000000u,
-                                        (r300_reg(s->r3, 0x4E38) >> 19) & 3);
+                            r300_cb_swap32(r300_reg(s->r3, 0x4E38) >> 19));
         int ab = ctz32(amask) / 8;
 
         if (gamma && degamma[255] == 0.0f) {

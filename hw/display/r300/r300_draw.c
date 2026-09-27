@@ -492,7 +492,7 @@ static void set_uniforms(const R300State *st, R300DrawPacket *pkt)
     for (int n = 0; n < 4; n++) {
         u->out_sel[n] = (outfmt >> (8 + 2 * n)) & 3;
     }
-    u->rt_swap32 = ((r300_reg(st, RB3D_COLORPITCH0) >> 19) & 3) == 2;
+    u->rt_swap32 = r300_cb_swap32(r300_reg(st, RB3D_COLORPITCH0) >> 19) == 2;
     u->rt_endian = (r300_reg(st, RB3D_COLORPITCH0) >> 19) & 3;
     u->clip_rule = r300_reg(st, SC_CLIP_RULE) & 0xFFFF;
     for (int i = 0; i < 4; i++) {

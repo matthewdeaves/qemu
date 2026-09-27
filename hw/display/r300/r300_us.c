@@ -876,7 +876,7 @@ static const char us_prelude[] =
 "/* Colour (r,g,b,a) <-> the raw RGBA8 view of the colour buffer.  The\n"
 "   card writes channel Cn = sel[n] of the colour (0 A, 1 R, 2 G, 3 B;\n"
 "   US_OUT_FMT C0..C3_SEL) to byte n of a little-endian word; with swap\n"
-"   (COLOR_ENDIAN 2) the word is stored byte-reversed. */\n"
+"   (COLOR_ENDIAN 0 or 2, r300_cb_swap32) it is stored byte-reversed. */\n"
 "static float r300_chan(float4 c, uint s)\n"
 "{\n"
 "    return s == 0 ? c.a : s == 1 ? c.r : s == 2 ? c.g : c.b;\n"
@@ -1075,7 +1075,7 @@ static void us_emit_cb(R300Sb *sb, const R300State *st, unsigned k)
     } else {
         snprintf(sel, sizeof(sel), "uint4(%uu, %uu, %uu, %uu)", (ofr >> 8) & 3,
                  (ofr >> 10) & 3, (ofr >> 12) & 3, (ofr >> 14) & 3);
-        snprintf(swap, sizeof(swap), "%uu", e == 2);
+        snprintf(swap, sizeof(swap), "%uu", r300_cb_swap32(e) == 2);
     }
     for (int n = 0; n < 4; n++) {
         sg[n] = (ofr >> (16 + n)) & 1;

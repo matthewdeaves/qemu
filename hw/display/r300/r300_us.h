@@ -147,6 +147,24 @@ enum {
 };
 uint32_t r300_cb_view(uint32_t colorformat, uint32_t outfmt, uint32_t *bpp);
 
+/*
+ * The byte order an ARGB8888 (C4_8) colour buffer is stored in here, as
+ * a dword swap (0 none, 1 16-bit, 2 32-bit, 3 half-dword) of the ARGB
+ * dword for COLOR_ENDIAN endian.  COLOR_ENDIAN 0 is stored like 2.
+ *
+ * Apple's driver samples what it rendered with TXO_ENDIAN 0 and expects
+ * back the dword it wrote, whether it rendered with COLOR_ENDIAN 2 (the
+ * desktop: BGRA outputs, sampled ZYX) or 0 (Quake's warp textures for
+ * water, lava and teleporters: RGBA outputs, sampled XYZ).  The texture
+ * rule (TXO_ENDIAN 0 reads the big-endian dword) round-trips only the
+ * swapped layout; storing COLOR_ENDIAN 0 little-endian turned those
+ * surfaces red, alpha landing in the red channel.
+ */
+static inline unsigned r300_cb_swap32(unsigned endian)
+{
+    return (endian & 3) == 0 ? 2 : endian & 3;
+}
+
 /* R300 US constants are 24-bit floats (1 sign, 7 exponent, 16 mantissa). */
 float r300_float24(uint32_t v);
 
