@@ -6913,6 +6913,21 @@ typedef struct R300Pipe {
 } R300Pipe;
 static GHashTable *g_r300_pipes;        /* uint64 hash -> R300Pipe chain */
 static unsigned g_r300_npipes;
+/*
+ * qemu#5: r300_pipeline() below drops the BQL for the length of a shader
+ * compile, which is the only thing serialising every other caller (draws
+ * already run off-thread -- see r200_render_draw's own need_bql pattern).
+ * Two draws racing the same, or a colliding, cache key each read the
+ * table's head before compiling, then spliced their own new entry onto
+ * that now-stale head after compiling -- whichever finished and replaced
+ * last silently dropped the other's entry from the chain (the table's
+ * value destroy func is NULL, so nothing even frees it: a leaked
+ * R300Pipe and its MTLRenderPipelineState, not a crash, but a real
+ * resource leak under contention). A dedicated lock, on the same pattern
+ * as g_r200_arena_lock, protects just the lookup/splice; the compile
+ * itself still runs without holding it or the BQL.
+ */
+static pthread_mutex_t g_r300_pipes_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Sampler states by r300_sampler's key, open addressing: looked up for
  * every unit of every draw, so no boxing into NSNumbers. */
@@ -6957,17 +6972,19 @@ static id<MTLRenderPipelineState> r300_pipeline(id<MTLDevice> dev,
         h = (h ^ (uint64_t)cfmt[k]) * 0x9E3779B97F4A7C15ull;
     }
     h = (h ^ (uint64_t)zfmt ^ ((uint64_t)ncb << 32)) * 0x9E3779B97F4A7C15ull;
+    pthread_mutex_lock(&g_r300_pipes_lock);
     if (!g_r300_pipes) {
         g_r300_pipes = g_hash_table_new_full(g_int64_hash, g_int64_equal,
                                              g_free, NULL);
     }
-    R300Pipe *head = g_hash_table_lookup(g_r300_pipes, &h);
-    for (R300Pipe *e = head; e; e = e->next) {
+    for (R300Pipe *e = g_hash_table_lookup(g_r300_pipes, &h); e; e = e->next) {
         if (e->msl_id == msl_id && e->ncb == ncb && e->zfmt == zfmt &&
             ncb <= 4 && !memcmp(e->cfmt, cfmt, ncb * sizeof(*cfmt))) {
+            pthread_mutex_unlock(&g_r300_pipes_lock);
             return e->pipe;
         }
     }
+    pthread_mutex_unlock(&g_r300_pipes_lock);
 
     /* Shader compilation and archive IO can block. Arguments are copied
      * before this call, and the pipeline cache is host-only, so release
@@ -7020,17 +7037,29 @@ static id<MTLRenderPipelineState> r300_pipeline(id<MTLDevice> dev,
         return nil;
     }
 
+    pthread_mutex_lock(&g_r300_pipes_lock);
+    /* Someone else may have compiled and inserted this exact key while we
+     * were compiling ours (the BQL, dropped above, was never what
+     * serialised this). Keep theirs, let ARC release our redundant p. */
+    for (R300Pipe *w = g_hash_table_lookup(g_r300_pipes, &h); w; w = w->next) {
+        if (w->msl_id == msl_id && w->ncb == ncb && w->zfmt == zfmt &&
+            ncb <= 4 && !memcmp(w->cfmt, cfmt, ncb * sizeof(*cfmt))) {
+            pthread_mutex_unlock(&g_r300_pipes_lock);
+            return w->pipe;
+        }
+    }
     R300Pipe *e = g_new0(R300Pipe, 1);
     e->msl_id = msl_id;
     memcpy(e->cfmt, cfmt, MIN(ncb, 4u) * sizeof(*cfmt));
     e->ncb = ncb;
     e->zfmt = zfmt;
     e->pipe = p;                        /* the table owns the reference */
-    e->next = head;
+    e->next = g_hash_table_lookup(g_r300_pipes, &h);      /* a fresh head */
     g_hash_table_replace(g_r300_pipes, g_memdup2(&h, sizeof(h)), e);
     if (++g_r300_npipes % 16 == 1 && r200_diag_on()) {
         qemu_log("ppc-mac-gpu r300: %u fragment pipelines\n", g_r300_npipes);
     }
+    pthread_mutex_unlock(&g_r300_pipes_lock);
     return p;
 }
 
