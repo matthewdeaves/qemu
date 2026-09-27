@@ -2439,6 +2439,23 @@ static void r200_macrotile_validate(uint32_t pitch_pixels,
  * Used by Phase 3A probe surface validation to verify identity
  * before/after NOP-blend draws.
  */
+/*
+ * minimumLinearTextureAlignmentForPixelFormat: walks Metal's feature
+ * tables on every call, several times a draw; the answer never changes.
+ */
+static NSUInteger mtl_linear_align(id<MTLDevice> dev, MTLPixelFormat pf)
+{
+    static NSUInteger align[1024];
+
+    if (pf >= ARRAY_SIZE(align)) {
+        return [dev minimumLinearTextureAlignmentForPixelFormat:pf];
+    }
+    if (!align[pf]) {
+        align[pf] = [dev minimumLinearTextureAlignmentForPixelFormat:pf];
+    }
+    return align[pf];
+}
+
 /* Bring-up diagnostics: real per-draw work (CRC scans, probes), off by default. */
 static bool r200_diag_on(void)
 {
@@ -6346,7 +6363,7 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         return -1;
     }
     MTLPixelFormat rtpf = rt16 ? MTLPixelFormatR16Uint : MTLPixelFormatBGRA8Unorm;
-    NSUInteger align = [dev minimumLinearTextureAlignmentForPixelFormat:rtpf];
+    NSUInteger align = mtl_linear_align(dev, rtpf);
     uint32_t bpr = pkt->rt_pitch * (rt16 ? 2 : 4);
     if ((pkt->rt_offset % align) || (bpr % align)) {
         r200_metal_warn(2, "render target not aligned for a linear view",
@@ -6614,7 +6631,7 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                 u.texfilt[t][0] = tu->filter;
                 continue;
             }
-            NSUInteger talign = [dev minimumLinearTextureAlignmentForPixelFormat:pf];
+            NSUInteger talign = mtl_linear_align(dev, pf);
             if ((tu->offset % talign) || (tu->pitch % talign) ||
                 tu->pitch < tu->width * bpp ||
                 (uint64_t)tu->offset + (uint64_t)tu->pitch * tu->height > vram_size) {
@@ -6690,7 +6707,7 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                 /* guest depth buffer, in place, as a second colour attachment */
                 R200TexKey dk = { pkt->depth_offset, pkt->rt_width, pkt->rt_height,
                                   pkt->depth_pitch * pkt->depth_bpp, (uint32_t)zpf };
-                NSUInteger za = [dev minimumLinearTextureAlignmentForPixelFormat:zpf];
+                NSUInteger za = mtl_linear_align(dev, zpf);
                 if ((pkt->depth_bpp == 2 && !g_r200_pipeline_z16) ||
                     pkt->depth_pitch < pkt->rt_width || (dk.offset % za) ||
                     (dk.pitch % za) ||
@@ -6864,7 +6881,13 @@ typedef struct R300Pipe {
 } R300Pipe;
 static GHashTable *g_r300_pipes;        /* uint64 hash -> R300Pipe chain */
 static unsigned g_r300_npipes;
-static NSMutableDictionary<NSNumber *, id<MTLSamplerState>> *g_r300_samplers;
+/* Sampler states by r300_sampler's key, open addressing: looked up for
+ * every unit of every draw, so no boxing into NSNumbers. */
+#define R300_NSAMPLERS 1024
+static struct {
+    uint32_t key;
+    id<MTLSamplerState> s;
+} g_r300_samplers[R300_NSAMPLERS];
 
 static void r300_metal_warn(uint32_t bit, const char *msg)
 {
@@ -7005,14 +7028,16 @@ static id<MTLSamplerState> r300_sampler(id<MTLDevice> dev, uint32_t f0,
                                         uint32_t levels)
 {
     uint32_t key = (f0 & 0xFFFFFF) | (MIN(levels, 15u) << 24);
+    uint32_t slot = (key * 0x9E3779B1u) >> 22;       /* 10 bits */
     id<MTLSamplerState> s;
 
-    if (!g_r300_samplers) {
-        g_r300_samplers = [[NSMutableDictionary alloc] init];
-    }
-    s = g_r300_samplers[@(key)];
-    if (s) {
-        return s;
+    for (int i = 0; i < 8; i++, slot = (slot + 1) % R300_NSAMPLERS) {
+        if (!g_r300_samplers[slot].s) {
+            break;
+        }
+        if (g_r300_samplers[slot].key == key) {
+            return g_r300_samplers[slot].s;
+        }
     }
     uint32_t mag = (f0 >> 9) & 3, min = (f0 >> 11) & 3, mip = (f0 >> 13) & 3;
     MTLSamplerDescriptor *d = [[MTLSamplerDescriptor alloc] init];
@@ -7031,8 +7056,10 @@ static id<MTLSamplerState> r300_sampler(id<MTLDevice> dev, uint32_t f0,
     d.lodMaxClamp = levels ? levels - 1 : 0;
     s = [dev newSamplerStateWithDescriptor:d];
     [d release];
-    g_r300_samplers[@(key)] = s;
-    [s release];
+    /* Eight probes found no room: evict the slot after them. */
+    [g_r300_samplers[slot].s release];
+    g_r300_samplers[slot].key = key;
+    g_r300_samplers[slot].s = s;           /* the table owns the reference */
     return s;
 }
 
@@ -7150,6 +7177,7 @@ static struct {
     id<MTLTexture> tex;
     uint64_t used;
 } g_r300_tcache[R300_TCACHE];
+static uint8_t g_r300_tcache_hint[256];    /* slot by address, see r300_texture_full */
 static uint64_t g_r300_tcache_clock;
 
 /* One face/slice of one level as the Metal format wants it (tight rows). */
@@ -7236,10 +7264,16 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
     uint64_t hash = 0;
     bool hashed = false;
     int lru = 0, hit = -1;
-    for (int i = 0; i < R300_TCACHE; i++) {
+    /* Where this address was last found: a draw's textures are usually
+     * the previous draw's, and the scan below is 256 compares. */
+    uint8_t *hint = &g_r300_tcache_hint[(key.addr >> 12 ^ key.addr >> 20) & 255];
+    if (g_r300_tcache[*hint].tex && !memcmp(&g_r300_tcache[*hint].key, &key, sizeof(key))) {
+        hit = *hint;
+    }
+    for (int i = 0; hit < 0 && i < R300_TCACHE; i++) {
         if (g_r300_tcache[i].tex && g_r300_tcache[i].key.addr == key.addr &&
             !memcmp(&g_r300_tcache[i].key, &key, sizeof(key))) {
-            hit = i;
+            hit = *hint = i;
             break;
         }
         if (g_r300_tcache[i].used < g_r300_tcache[lru].used) {
@@ -7300,6 +7334,7 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
         }
     }
     [g_r300_tcache[lru].tex release];
+    *hint = lru;
     g_r300_tcache[lru].key = key;
     g_r300_tcache[lru].hash = hash;
     g_r300_tcache[lru].gen = known ? td->write_gen : 0;
@@ -7322,7 +7357,7 @@ static id<MTLTexture> r300_texture_raw(PPCMacGPUMetalState *st, id<MTLDevice> de
 {
     uint32_t eb = td->view_bpp;
     MTLPixelFormat rpf = r300_raw_pf(eb);
-    NSUInteger align = [dev minimumLinearTextureAlignmentForPixelFormat:rpf];
+    NSUInteger align = mtl_linear_align(dev, rpf);
     uint32_t p0 = td->pitch_bytes;
 
     if (!td->host_data && p0 && !(p0 % eb) && !(p0 % align) && !(td->gpu_addr % align)) {
@@ -7408,7 +7443,7 @@ static id<MTLTexture> r300_texture(PPCMacGPUMetalState *st, id<MTLDevice> dev,
     }
     if (pf != MTLPixelFormatInvalid) {
         /* Zero-copy view over VRAM. */
-        NSUInteger align = [dev minimumLinearTextureAlignmentForPixelFormat:pf];
+        NSUInteger align = mtl_linear_align(dev, pf);
         if ((td->gpu_addr % align) || (td->pitch_bytes % align)) {
             r300_metal_warn(8, "texture not aligned for a linear view");
             return nil;
@@ -7488,7 +7523,7 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         uint32_t bpr = ns * (k ? pkt->cb[k].pitch * pkt->cb[k].bpp
                                : pkt->rt_pitch * pkt->rt_bpp);
         cpf[k] = r300_rt_pf(view);
-        NSUInteger align = [dev minimumLinearTextureAlignmentForPixelFormat:cpf[k]];
+        NSUInteger align = mtl_linear_align(dev, cpf[k]);
         if ((addr % align) || (bpr % align) || !bpr ||
             (uint64_t)addr + (uint64_t)bpr * pkt->rt_height > vram_size) {
             if (k == 0) {
@@ -7518,7 +7553,7 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                           pkt->rt_height, ns * zd->pitch * zd->bpp, (uint32_t)zpf };
         bool want_ds = zd->attach;
         if (want_ds) {
-            NSUInteger za = [dev minimumLinearTextureAlignmentForPixelFormat:zpf];
+            NSUInteger za = mtl_linear_align(dev, zpf);
             if (zd->pitch < pkt->rt_width || (dk.offset % za) || (dk.pitch % za) ||
                 (uint64_t)dk.offset + (uint64_t)dk.pitch * dk.height > vram_size) {
                 r300_metal_warn(16, "depth buffer not usable in place");
