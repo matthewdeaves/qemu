@@ -492,103 +492,6 @@ static id<MTLRenderPipelineState> metal_get_blend_pipeline(
 }
 
 /* ========================================================================
- * Create a render target aliased directly into VRAM (zero-copy path)
- *
- * Instead of creating a standalone MTLTexture, this creates a texture
- * VIEW over the shared VRAM MTLBuffer.  GPU draws go directly into the
- * same memory the guest CPU reads/writes.  This is how real VRAM works:
- * CPU memcpy and GPU 3D draws coexist on the same canvas.
- *
- * The texture is created at a specific VRAM byte offset with a specific
- * pitch (bytes per row).  Different compositor layers may use different
- * pitches at the same offset — Metal handles this via separate texture
- * views over the same buffer.
- * ======================================================================== */
-static bool metal_ensure_vram_render_target(PPCMacGPUMetalState *st,
-                                             uint32_t vram_offset,
-                                             uint32_t width, uint32_t height,
-                                             uint32_t pitch_pixels)
-{
-    if (!st->vramBuffer) {
-        /* No zero-copy VRAM — fall through to legacy path */
-        return false;
-    }
-
-    /*
-     * MASTER PITCH: always use 4096 bytes per row (1024 pixels).
-     *
-     * The PRESENT_BLIT reads at the CRTC pitch (1024 pixels = 4096 bpr).
-     * All 3D draws at this offset must use the same stride so the BLIT
-     * reads correctly.  The guest's color_pitch (832, 896, etc.) is
-     * irrelevant — on real R200, MC tiling reconciles different pitch
-     * views.  In our linear VRAM, we force a single consistent stride.
-     *
-     * 4096 is already 256-byte aligned, satisfying Metal's requirements.
-     */
-    uint32_t master_bpr = 4096;           /* 1024 pixels * 4 bytes */
-    uint32_t master_width = 1024;         /* pixels per row */
-    uint64_t buffer_offset = (uint64_t)vram_offset;
-
-    /* Validate offset + size fits within VRAM */
-    uint64_t needed = buffer_offset + (uint64_t)height * master_bpr;
-    if (needed > st->vram_size) {
-        return false;
-    }
-
-    uint32_t aligned_bpr = master_bpr;
-    uint32_t aligned_width = master_width;
-
-    /* Check if we can reuse the current RT (same offset, pitch, size) */
-    if (st->renderTarget &&
-        st->rt_vram_offset == vram_offset &&
-        st->rt_width == aligned_width &&
-        st->rt_height >= height) {
-        return true;  /* Already bound */
-    }
-
-    /* Create texture descriptor */
-    MTLTextureDescriptor *desc = [MTLTextureDescriptor
-        texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-        width:aligned_width height:height mipmapped:NO];
-    desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-    desc.storageMode = MTLStorageModeShared;
-
-    /* Create texture as a VIEW over the VRAM MTLBuffer.
-     * This is the key zero-copy operation: the texture's pixel data
-     * IS the VRAM bytes at the specified offset. */
-    id<MTLTexture> tex = [st->vramBuffer
-        newTextureWithDescriptor:desc
-                          offset:buffer_offset
-                     bytesPerRow:aligned_bpr];
-    if (!tex) {
-        static int fail_log = 0;
-        if (fail_log < 5) {
-            qemu_log("ppc-mac-gpu-metal: VRAM texture alias failed "
-                     "off=0x%x %ux%u pitch=%u bpr=%u\n",
-                     vram_offset, width, height, pitch_pixels, aligned_bpr);
-            fail_log++;
-        }
-        return false;
-    }
-
-    st->renderTarget = tex;
-    st->outputBuffer = nil;  /* Not needed — texture IS VRAM */
-    st->rt_width = aligned_width;
-    st->rt_height = height;
-    st->rt_vram_offset = vram_offset;
-
-    static int alias_log = 0;
-    if (alias_log < 20) {
-        qemu_log("ppc-mac-gpu-metal: [VRAM_RT] alias off=0x%x %ux%u "
-                 "pitch=%u bpr=%u\n",
-                 vram_offset, aligned_width, height, pitch_pixels, aligned_bpr);
-        alias_log++;
-    }
-
-    return true;
-}
-
-/* ========================================================================
  * Create / resize the offscreen render target (legacy path)
  * ======================================================================== */
 static bool metal_ensure_render_target(PPCMacGPUMetalState *st,
@@ -668,153 +571,6 @@ static bool metal_ensure_render_target(PPCMacGPUMetalState *st,
 }
 
 /* ========================================================================
- * Per-(offset, pitch) render target cache
- *
- * Each unique (color_offset, color_pitch_pixels) gets its own Metal
- * texture and output buffer.  A new frame_gen does NOT inherit stale
- * content — the texture is cleared on creation or frame boundary.
- * Reuse is allowed only when: same offset, same pitch, same frame_gen.
- * ======================================================================== */
-static bool rt_cache_bind(PPCMacGPUMetalState *st,
-                          uint32_t offset, uint32_t pitch_pixels,
-                          uint32_t width, uint32_t height,
-                          bool *out_needs_clear)
-{
-    /* Search for existing entry matching (offset, pitch, frame_gen) */
-    int reuse_slot = -1;
-    int free_slot = -1;
-    int oldest_slot = 0;
-    uint32_t oldest_gen = UINT32_MAX;
-
-    for (int i = 0; i < RT_CACHE_MAX; i++) {
-        if (!st->rt_cache[i].valid) {
-            if (free_slot < 0) free_slot = i;
-            continue;
-        }
-        if (st->rt_cache[i].offset == offset &&
-            st->rt_cache[i].pitch_pixels == pitch_pixels &&
-            st->rt_cache[i].frame_gen == st->rt_frame_gen) {
-            reuse_slot = i;
-            break;
-        }
-        /* Track oldest for eviction */
-        if (st->rt_cache[i].frame_gen < oldest_gen) {
-            oldest_gen = st->rt_cache[i].frame_gen;
-            oldest_slot = i;
-        }
-    }
-
-    if (reuse_slot >= 0) {
-        /* Reuse — but may need to resize if dimensions grew */
-        int s = reuse_slot;
-        if (st->rt_cache[s].width >= width &&
-            st->rt_cache[s].height >= height) {
-            /* Exact match or larger — bind directly */
-            st->renderTarget = st->rt_cache[s].texture;
-            st->outputBuffer = st->rt_cache[s].outbuf;
-            st->rt_width = st->rt_cache[s].width;
-            st->rt_height = st->rt_cache[s].height;
-
-            if (out_needs_clear) {
-                *out_needs_clear = st->rt_cache[s].needs_clear;
-            }
-            st->rt_cache[s].needs_clear = false;
-
-            static int reuse_log = 0;
-            if (reuse_log < 30) {
-                fprintf(stderr, "[RT_CACHE_REUSE] slot=%d off=0x%x pitch=%u "
-                        "%ux%u gen=%u\n",
-                        s, offset, pitch_pixels,
-                        st->rt_cache[s].width, st->rt_cache[s].height,
-                        st->rt_frame_gen);
-                reuse_log++;
-            }
-            return true;
-        }
-        /* Need larger — fall through to create, will reuse this slot */
-        free_slot = s;
-        st->rt_cache[s].texture = nil;
-        st->rt_cache[s].outbuf = nil;
-        st->rt_cache[s].valid = false;
-    }
-
-    /* Allocate new entry */
-    int slot = (free_slot >= 0) ? free_slot : oldest_slot;
-
-    /* Evict old entry if reusing occupied slot */
-    if (st->rt_cache[slot].valid) {
-        static int inval_log = 0;
-        if (inval_log < 20) {
-            fprintf(stderr, "[RT_CACHE_INVALIDATE] slot=%d old off=0x%x "
-                    "pitch=%u gen=%u → evicted for off=0x%x pitch=%u gen=%u\n",
-                    slot,
-                    st->rt_cache[slot].offset,
-                    st->rt_cache[slot].pitch_pixels,
-                    st->rt_cache[slot].frame_gen,
-                    offset, pitch_pixels, st->rt_frame_gen);
-            inval_log++;
-        }
-        st->rt_cache[slot].texture = nil;
-        st->rt_cache[slot].outbuf = nil;
-        st->rt_cache[slot].valid = false;
-    }
-
-    /* Create new Metal texture */
-    MTLTextureDescriptor *desc = [MTLTextureDescriptor
-        texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-        width:width height:height mipmapped:NO];
-    desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-    desc.storageMode = MTLStorageModeShared;
-
-    id<MTLTexture> tex = [st->device newTextureWithDescriptor:desc];
-    if (!tex) {
-        qemu_log_mask(LOG_UNIMP, "ppc-mac-gpu-metal: RT cache create failed %ux%u\n",
-                      width, height);
-        return false;
-    }
-
-    uint64_t buf_size = (uint64_t)width * height * 4;
-    id<MTLBuffer> buf = [st->device newBufferWithLength:buf_size
-                                    options:MTLResourceStorageModeShared];
-    if (!buf) {
-        qemu_log_mask(LOG_UNIMP, "ppc-mac-gpu-metal: RT cache outbuf failed\n");
-        return false;
-    }
-
-    /* Mark for clear on first draw — the draw path will use
-     * MTLLoadActionClear instead of MTLLoadActionLoad.  This avoids
-     * a synchronous GPU wait here (which killed frame rate). */
-    if (out_needs_clear) {
-        *out_needs_clear = true;
-    }
-    st->rt_cache[slot].valid = true;
-    st->rt_cache[slot].needs_clear = false;  /* caller handles via out_needs_clear */
-    st->rt_cache[slot].offset = offset;
-    st->rt_cache[slot].pitch_pixels = pitch_pixels;
-    st->rt_cache[slot].width = width;
-    st->rt_cache[slot].height = height;
-    st->rt_cache[slot].frame_gen = st->rt_frame_gen;
-    st->rt_cache[slot].texture = tex;
-    st->rt_cache[slot].outbuf = buf;
-
-    /* Bind as active */
-    st->renderTarget = tex;
-    st->outputBuffer = buf;
-    st->rt_width = width;
-    st->rt_height = height;
-
-    static int create_log = 0;
-    if (create_log < 40) {
-        fprintf(stderr, "[RT_CACHE_CREATE] slot=%d off=0x%x pitch=%u "
-                "%ux%u gen=%u\n",
-                slot, offset, pitch_pixels, width, height,
-                st->rt_frame_gen);
-        create_log++;
-    }
-    return true;
-}
-
-/* ========================================================================
  * Create a temporary MTLTexture from guest VRAM data (with byte swap)
  * ======================================================================== */
 static id<MTLTexture> metal_texture_from_vram(PPCMacGPUMetalState *st,
@@ -890,7 +646,7 @@ static id<MTLTexture> metal_texture_from_vram(PPCMacGPUMetalState *st,
         texture2DDescriptorWithPixelFormat:mtlFmt
         width:width height:height mipmapped:NO];
     texDesc.usage = MTLTextureUsageShaderRead;
-    texDesc.storageMode = MTLStorageModeManaged;
+    texDesc.storageMode = MTLStorageModeShared;
 
     id<MTLTexture> tex = [st->device newTextureWithDescriptor:texDesc];
     if (!tex) {
@@ -1021,7 +777,6 @@ static void metal_extract_vertices(const PPCMacGPU3DState *state,
 {
     uint32_t fmt0 = state->se_vtx_fmt_0;
     uint32_t fmt1 = state->se_vtx_fmt_1;
-    uint32_t stride_dw = raw_stride_bytes / 4;
 
     /*
      * The Apple QE kext uses AOS (Array of Structures) descriptors to define
@@ -1074,7 +829,7 @@ static void metal_extract_vertices(const PPCMacGPU3DState *state,
         static int raw_dump_count = 0;
         if (raw_dump_count < 10) {
             fprintf(stderr, "[VTX_RAW] stride=%u calc=%u fmt0=0x%x fmt1=0x%x "
-                    "nverts=%u\n", raw_stride_bytes, calc_stride, fmt0, fmt1);
+                    "\n", raw_stride_bytes, calc_stride, fmt0, fmt1);
             for (uint32_t vi = 0; vi < 2; vi++) {
                 const float *s = (const float *)((const uint8_t *)raw_data +
                                                   (uint64_t)vi * raw_stride_bytes);
@@ -1435,26 +1190,6 @@ static int shadow_rt_find(PPCMacGPUMetalState *st,
 }
 
 /*
- * Find by offset only — returns the entry with the largest height
- * (most likely the final composited result).  Used by metal_blit_2d
- * when the BLT source pitch may not exactly match the 3D render pitch.
- */
-static int shadow_rt_find_by_offset(PPCMacGPUMetalState *st, uint32_t offset)
-{
-    int best = -1;
-    uint32_t best_h = 0;
-    for (int i = 0; i < SHADOW_RT_MAX; i++) {
-        if (st->shadow_rts[i].valid &&
-            st->shadow_rts[i].offset == offset &&
-            st->shadow_rts[i].height > best_h) {
-            best = i;
-            best_h = st->shadow_rts[i].height;
-        }
-    }
-    return best;
-}
-
-/*
  * Ensure a shadow RT entry exists for (offset, pitch), with at least
  * the specified width×height.  Allocates/resizes buffer as needed.
  * Returns slot index, or -1 if cache is full.
@@ -1595,14 +1330,12 @@ static void shadow_rt_save_region(PPCMacGPUMetalState *st,
     uint32_t sw = st->shadow_rts[slot].width;
     uint32_t sh = st->shadow_rts[slot].height;
     uint32_t *dst = st->shadow_rts[slot].pixels;
-    uint32_t nz_count = 0;
     for (uint32_t y = ry; y < ry + rh && y < sh; y++) {
         const uint32_t *src_row = metal_output + (uint64_t)y * rt_width;
         uint32_t *dst_row = dst + (uint64_t)y * sw;
         for (uint32_t x = rx; x < rx + rw && x < sw; x++) {
             uint32_t val = __builtin_bswap32(src_row[x]);
             dst_row[x] = val;
-            if (val != 0) nz_count++;
         }
     }
 }
@@ -1785,252 +1518,6 @@ static void drag_tracker_update(PPCMacGPUMetalState *st,
                 t->blit_h = prev_blit_h;
             }
         }
-    }
-}
-
-static bool drag_surface_is_tracked(PPCMacGPUMetalState *st, uint32_t src_offset)
-{
-    if (!st) {
-        return false;
-    }
-    for (int i = 0; i < DRAG_TRACKER_MAX; i++) {
-        if (st->drag_trackers[i].active &&
-            st->drag_trackers[i].src_offset == src_offset) {
-            return true;
-        }
-    }
-    return false;
-}
-
-/*
- * drag_body_copy — direct intra-framebuffer copy of window body pixels.
- *
- * Copies body pixels from old position to new position in VRAM using
- * memmove (handles overlapping regions correctly).  Row iteration
- * direction depends on the drag delta to avoid self-clobbering:
- *   dy > 0 (moving down): iterate bottom-to-top
- *   dy <= 0 (moving up):  iterate top-to-bottom
- *
- * Cleanup of the exposed old position is left to later compositor
- * presents; do not repaint it here with a sampled wallpaper color.
- */
-static void drag_body_copy(PPCMacGPUMetalState *st, uint8_t *vram,
-                           uint32_t fb_pitch,
-                           uint32_t prev_x, uint32_t prev_y,
-                           uint32_t blit_w, uint32_t blit_h,
-                           int32_t dx, int32_t dy,
-                           uint32_t screen_w, uint32_t screen_h)
-{
-    /*
-     * Copy only the client/body area. The Finder drag artifacts strongly
-     * suggest a symmetric inset is too coarse: it drags pieces of the
-     * titlebar/frame/shadow along with the body and then protects too much
-     * of the subsequent QE present. Keep the interior move asymmetric so
-     * the QE-owned frame stays in the fresh Metal->VRAM pass.
-     */
-    int32_t body_x = (int32_t)prev_x + DRAG_INSET_LEFT;
-    int32_t body_y = (int32_t)prev_y + DRAG_INSET_TOP;
-    int32_t body_w = (int32_t)blit_w - DRAG_INSET_LEFT - DRAG_INSET_RIGHT;
-    int32_t body_h = (int32_t)blit_h - DRAG_INSET_TOP - DRAG_INSET_BOTTOM;
-
-    if (body_w <= 0 || body_h <= 0) return;
-
-    /* Clip source (old position) to screen */
-    if (body_x < 0) { body_w += body_x; body_x = 0; }
-    if (body_y < 0) { body_h += body_y; body_y = 0; }
-    if (body_x + body_w > (int32_t)screen_w) body_w = screen_w - body_x;
-    if (body_y + body_h > (int32_t)screen_h) body_h = screen_h - body_y;
-    if (body_w <= 0 || body_h <= 0) return;
-
-    /* Clip dest (new position) to screen */
-    int32_t dst_x = body_x + dx;
-    int32_t dst_y = body_y + dy;
-    if (dst_x < 0) { body_w += dst_x; body_x -= dst_x; dst_x = 0; }
-    if (dst_y < 0) { body_h += dst_y; body_y -= dst_y; dst_y = 0; }
-    if (dst_x + body_w > (int32_t)screen_w) body_w = screen_w - dst_x;
-    if (dst_y + body_h > (int32_t)screen_h) body_h = screen_h - dst_y;
-    if (body_w <= 0 || body_h <= 0) return;
-
-    /* VRAM bounds check for both src and dst */
-    uint64_t src_max = (uint64_t)(body_y + body_h - 1) * fb_pitch +
-                       (uint64_t)(body_x + body_w) * 4;
-    uint64_t dst_max = (uint64_t)(dst_y + body_h - 1) * fb_pitch +
-                       (uint64_t)(dst_x + body_w) * 4;
-    if (src_max > st->vram_size || dst_max > st->vram_size) return;
-
-    /* Copy body with correct row ordering to handle overlap */
-    uint32_t row_bytes = (uint32_t)body_w * 4;
-    if (dy > 0) {
-        /* Moving down: copy bottom-to-top */
-        for (int32_t row = body_h - 1; row >= 0; row--) {
-            uint8_t *src = vram + (uint64_t)(body_y + row) * fb_pitch +
-                           (uint64_t)body_x * 4;
-            uint8_t *dst = vram + (uint64_t)(dst_y + row) * fb_pitch +
-                           (uint64_t)dst_x * 4;
-            memmove(dst, src, row_bytes);
-        }
-    } else {
-        /* Moving up or horizontally: copy top-to-bottom */
-        for (int32_t row = 0; row < body_h; row++) {
-            uint8_t *src = vram + (uint64_t)(body_y + row) * fb_pitch +
-                           (uint64_t)body_x * 4;
-            uint8_t *dst = vram + (uint64_t)(dst_y + row) * fb_pitch +
-                           (uint64_t)dst_x * 4;
-            memmove(dst, src, row_bytes);
-        }
-    }
-
-    st->drag_protect_active = true;
-    st->drag_protect_x = dst_x;
-    st->drag_protect_y = dst_y;
-    st->drag_protect_w = body_w;
-    st->drag_protect_h = body_h;
-
-    static int drag_log = 0;
-    if (drag_log < 200) {
-        fprintf(stderr, "[DRAG_BODY_COPY] src=(%d,%d) dst=(%d,%d) "
-                "delta=(%d,%d) body=%dx%d\n",
-                body_x, body_y, dst_x, dst_y, dx, dy,
-                body_w, body_h);
-        drag_log++;
-    }
-}
-
-static uint32_t drag_restore_strip(PPCMacGPUMetalState *st, uint8_t *vram,
-                                   uint32_t fb_pitch,
-                                   int32_t full_x, int32_t full_y,
-                                   int32_t local_x0, int32_t local_y0,
-                                   int32_t strip_w, int32_t strip_h,
-                                   uint32_t screen_w, uint32_t screen_h,
-                                   const uint32_t *srt_pixels,
-                                   uint32_t srt_w, uint32_t srt_h,
-                                   uint32_t srt_stride,
-                                   uint32_t src_x, uint32_t src_y)
-{
-    uint32_t restored = 0;
-
-    if (!st || !vram || !srt_pixels || strip_w <= 0 || strip_h <= 0) {
-        return 0;
-    }
-
-    for (int32_t row = 0; row < strip_h; row++) {
-        int32_t local_y = local_y0 + row;
-        int32_t dst_y = full_y + local_y;
-        uint32_t sy = src_y + (uint32_t)local_y;
-        if (dst_y < 0 || dst_y >= (int32_t)screen_h || sy >= srt_h) {
-            continue;
-        }
-
-        for (int32_t col = 0; col < strip_w; col++) {
-            int32_t local_x = local_x0 + col;
-            int32_t dst_x = full_x + local_x;
-            uint32_t sx = src_x + (uint32_t)local_x;
-            if (dst_x < 0 || dst_x >= (int32_t)screen_w || sx >= srt_w) {
-                continue;
-            }
-
-            uint32_t pixel_be = srt_pixels[(uint64_t)sy * srt_stride + sx];
-            uint32_t alpha = pixel_be & 0xFF;
-            if (alpha < 254) {
-                continue;
-            }
-
-            uint64_t dst_addr = (uint64_t)dst_y * fb_pitch +
-                                (uint64_t)dst_x * 4;
-            if (dst_addr + 4 > st->vram_size) {
-                continue;
-            }
-            *(uint32_t *)(vram + dst_addr) = pixel_be;
-            restored++;
-        }
-    }
-
-    return restored;
-}
-
-/*
- * Restore the old exposed drag strips from opaque compositor pixels in the SRT.
- *
- * This is a narrower cleanup than the old wallpaper-color fill. We only write
- * fully opaque SRT pixels from the *source* region that is being moved, which
- * gives us real compositor-provided background pixels for the exposed strips
- * without inventing colors or touching semi-transparent shadow data.
- */
-static void drag_cleanup_exposed(PPCMacGPUMetalState *st, uint8_t *vram,
-                                 uint32_t fb_pitch,
-                                 uint32_t prev_x, uint32_t prev_y,
-                                 uint32_t blit_w, uint32_t blit_h,
-                                 int32_t dx, int32_t dy,
-                                 uint32_t screen_w, uint32_t screen_h,
-                                 const uint32_t *srt_pixels,
-                                 uint32_t srt_w, uint32_t srt_h,
-                                 uint32_t srt_stride,
-                                 uint32_t src_x, uint32_t src_y)
-{
-    if (!st || !vram || !srt_pixels || blit_w == 0 || blit_h == 0) {
-        return;
-    }
-
-    uint32_t restored = 0;
-    int32_t full_x = (int32_t)prev_x;
-    int32_t full_y = (int32_t)prev_y;
-    int32_t full_w = (int32_t)blit_w;
-    int32_t full_h = (int32_t)blit_h;
-
-    if (dy != 0) {
-        int32_t strip_h = abs(dy);
-        if (strip_h > full_h) {
-            strip_h = full_h;
-        }
-        if (dy > 0) {
-            restored += drag_restore_strip(st, vram, fb_pitch,
-                                           full_x, full_y,
-                                           0, 0, full_w, strip_h,
-                                           screen_w, screen_h,
-                                           srt_pixels, srt_w, srt_h,
-                                           srt_stride, src_x, src_y);
-        } else {
-            restored += drag_restore_strip(st, vram, fb_pitch,
-                                           full_x, full_y,
-                                           0, full_h - strip_h,
-                                           full_w, strip_h,
-                                           screen_w, screen_h,
-                                           srt_pixels, srt_w, srt_h,
-                                           srt_stride, src_x, src_y);
-        }
-    }
-
-    if (dx != 0) {
-        int32_t strip_w = abs(dx);
-        if (strip_w > full_w) {
-            strip_w = full_w;
-        }
-        if (dx > 0) {
-            restored += drag_restore_strip(st, vram, fb_pitch,
-                                           full_x, full_y,
-                                           0, 0, strip_w, full_h,
-                                           screen_w, screen_h,
-                                           srt_pixels, srt_w, srt_h,
-                                           srt_stride, src_x, src_y);
-        } else {
-            restored += drag_restore_strip(st, vram, fb_pitch,
-                                           full_x, full_y,
-                                           full_w - strip_w, 0,
-                                           strip_w, full_h,
-                                           screen_w, screen_h,
-                                           srt_pixels, srt_w, srt_h,
-                                           srt_stride, src_x, src_y);
-        }
-    }
-
-    static int cleanup_log = 0;
-    if (cleanup_log < 120) {
-        fprintf(stderr,
-                "[DRAG_CLEANUP] old=(%d,%d) size=%dx%d delta=(%d,%d) "
-                "src=(%u,%u) restored=%u\n",
-                full_x, full_y, full_w, full_h, dx, dy,
-                src_x, src_y, restored);
-        cleanup_log++;
     }
 }
 
@@ -3473,10 +2960,8 @@ static void metal_writeback_vram_region(PPCMacGPUMetalState *st,
      * from Metal writeback to prove write path + tiling formula used.
      * Only log once per RT offset, for 6 representative pixels.
      */
-    static uint32_t tile_audit_rt = 0;
     static bool tile_audit_done = false;
     if (!tile_audit_done && macro_tiled && rw >= 128 && rh >= 32) {
-        tile_audit_rt = color_offset;
         tile_audit_done = true;
         /* Sample points: (0,0), (63,0), (64,0), (0,15), (0,16), (100,20) */
         static const uint32_t sample_xy[][2] = {
@@ -3538,7 +3023,7 @@ static void metal_writeback_vram_region(PPCMacGPUMetalState *st,
                 /* Phase A — VRAM write watch: window texture tile range */
                 if (offset >= 0x353000 && offset < 0x413000) {
                     static int wb_watch_log = 0;
-                    if (wb_watch_log < 50) {
+                    if (r200_diag_on() && wb_watch_log < 50) {
                         uint32_t pixel_le = src_row[x];
                         fprintf(stderr, "[VRAM_WATCH] metal_writeback "
                                 "off=0x%06llx val=0x%08x(LE) x=%u y=%u "
@@ -5475,7 +4960,7 @@ static int metal_draw_3d(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                     probe_mismatch_total++;
                     /* Find first mismatched pixel */
                     uint32_t fm_x = 0, fm_y = 0;
-                    uint32_t fm_before = 0, fm_after = 0;
+                    uint32_t fm_after = 0;
                     bool found = false;
                     /* Re-scan: we need before data, but it was overwritten.
                      * We can't recover exact before values cheaply, so report
@@ -6249,45 +5734,6 @@ static struct {
     uint64_t used;
     bool fresh;                 /* never rendered: first pass clears it */
 } g_r200_depth[R200_MAX_DEPTH];
-static uint64_t g_r200_depth_clock;
-
-static id<MTLTexture> r200_depth_tex(id<MTLDevice> dev, uint32_t offset,
-                                     uint32_t pitch, uint32_t bpp, bool create)
-{
-    int lru = 0;
-    for (int i = 0; i < R200_MAX_DEPTH; i++) {
-        if (g_r200_depth[i].tex && g_r200_depth[i].offset == offset &&
-            g_r200_depth[i].pitch == pitch) {
-            g_r200_depth[i].used = ++g_r200_depth_clock;
-            return g_r200_depth[i].tex;
-        }
-        if (g_r200_depth[i].used < g_r200_depth[lru].used) {
-            lru = i;
-        }
-    }
-    if (!create) {
-        return nil;
-    }
-    MTLTextureDescriptor *d = [MTLTextureDescriptor
-        texture2DDescriptorWithPixelFormat:R200_DS_FORMAT width:pitch
-                                    height:2048 mipmapped:NO];
-    d.usage = MTLTextureUsageRenderTarget;
-    d.storageMode = MTLStorageModePrivate;
-    id<MTLTexture> t = [dev newTextureWithDescriptor:d];
-    if (!t) {
-        return nil;
-    }
-    [g_r200_depth[lru].tex release];
-    g_r200_depth[lru].offset = offset;
-    g_r200_depth[lru].pitch = pitch;
-    g_r200_depth[lru].bpp = bpp;
-    g_r200_depth[lru].tex = t;
-    g_r200_depth[lru].used = ++g_r200_depth_clock;
-    g_r200_depth[lru].fresh = true;
-    qemu_log("ppc-mac-gpu r200: depth buffer at 0x%x, pitch %u, %u-bit\n",
-             offset, pitch, bpp * 8);
-    return t;
-}
 
 static MTLCompareFunction r200_cmp(uint32_t f)
 {
@@ -7486,7 +6932,7 @@ static id<MTLRenderPipelineState> r300_pipeline(id<MTLDevice> dev,
     e->pipe = p;                        /* the table owns the reference */
     e->next = head;
     g_hash_table_replace(g_r300_pipes, g_memdup2(&h, sizeof(h)), e);
-    if (++g_r300_npipes % 16 == 1) {
+    if (++g_r300_npipes % 16 == 1 && r200_diag_on()) {
         qemu_log("ppc-mac-gpu r300: %u fragment pipelines\n", g_r300_npipes);
     }
     return p;

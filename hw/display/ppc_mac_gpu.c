@@ -1298,7 +1298,7 @@ static void r200_set_present_pitch(PPCMacGPUState *s, uint32_t dst_pitch)
 
     if (dst_pitch < min) {
         static int pitch_reject_log;
-        if (pitch_reject_log < 10) {
+        if (gpu_diag_on() && pitch_reject_log < 10) {
             fprintf(stderr, "[STRIDE_CHANGE] ignoring BLT pitch %u for "
                     "%ux%u@%u (needs %u)\n", dst_pitch, s->disp.width,
                     s->disp.height, s->disp.bpp, min);
@@ -1415,10 +1415,12 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
         old.width != 0 && old.height != 0 &&
         (old.width != m->width || old.height != m->height ||
          old.bpp != m->bpp)) {
-        fprintf(stderr, "[STRIDE_CHANGE] mode change %ux%u->%ux%u: "
-                "clearing stride override (was %u)\n",
-                old.width, old.height, m->width, m->height,
-                s->disp_stride_override_value);
+        if (gpu_diag_on()) {
+            fprintf(stderr, "[STRIDE_CHANGE] mode change %ux%u->%ux%u: "
+                    "clearing stride override (was %u)\n",
+                    old.width, old.height, m->width, m->height,
+                    s->disp_stride_override_value);
+        }
         s->disp_stride_override_active = false;
         s->disp_stride_override_value = 0;
     }
@@ -1434,7 +1436,7 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
     if (s->disp_stride_override_active && s->disp_stride_override_value > 0) {
         if (m->stride != s->disp_stride_override_value) {
             static int stride_override_log = 0;
-            if (stride_override_log < 20) {
+            if (gpu_diag_on() && stride_override_log < 20) {
                 fprintf(stderr, "[STRIDE_CHANGE] update_display_mode: "
                         "CRTC gives %u, override forces %u\n",
                         m->stride, s->disp_stride_override_value);
@@ -1466,6 +1468,9 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
 
     /* Check if mode changed */
     if (memcmp(&old, m, sizeof(old)) != 0) {
+        if (!gpu_diag_on()) {
+            return true;
+        }
         fprintf(stderr, "GPU MODE: %ux%u bpp=%u stride=%u offset=0x%x pitch_reg=0x%x crtc_gen=0x%x\n",
                 m->width, m->height, m->bpp, m->stride, m->offset, pitch, crtc_gen);
         if (old.stride != m->stride) {
@@ -1529,7 +1534,7 @@ static void ppc_mac_gpu_display_update(void *opaque)
         if (!r200_rate.since) {
             r200_rate.since = now;
         } else if (now - r200_rate.since >= 1000000) {
-            if (r200_rate.draws || r200_rate.ops2d) {
+            if (TRACE_ON("PPCGPU_RATE") && (r200_rate.draws || r200_rate.ops2d)) {
                 double sec = (now - r200_rate.since) / 1e6;
                 qemu_log("ppc-mac-gpu rate: %.1f flips/s, %.1f present-ops/s, "
                          "%.0f draws/s, "
@@ -2063,13 +2068,6 @@ static void ppc_mac_gpu_rptr_writeback(PPCMacGPUState *s)
     }
     address_space_write(&address_space_memory, phys, MEMTXATTRS_UNSPECIFIED,
                         &wire_val, 4);
-}
-
-static void ppc_mac_gpu_scratch_writeback(PPCMacGPUState *s, int reg_idx)
-{
-    if (reg_idx >= 0 && reg_idx <= 5) {
-        ppc_mac_gpu_scratch_writeback_val(s, reg_idx, s->regs.scratch_reg[reg_idx]);
-    }
 }
 
 /* Tell the renderer about a 2D fill (mirrors depth-buffer clears). */
@@ -3852,7 +3850,7 @@ static void ppc_mac_gpu_host_data_write(PPCMacGPUState *s, uint32_t val)
     /* Phase A — VRAM write watch: window texture tile range */
     if (linear_addr >= 0x353000 && linear_addr < 0x413000) {
         static int hd_watch_log = 0;
-        if (hd_watch_log < 50) {
+        if (gpu_diag_on() && hd_watch_log < 50) {
             fprintf(stderr, "[VRAM_WATCH] host_data_write linear=0x%06llx "
                     "val=0x%08x x=%u y=%u off=0x%x pitch=%u\n",
                     (unsigned long long)linear_addr, val,
@@ -4039,25 +4037,6 @@ static int mc_register_tiled_surface(PPCMacGPUState *s,
 }
 
 /*
- * Unregister a tiled surface by base address.
- */
-static void mc_unregister_tiled_surface(PPCMacGPUState *s, uint32_t base)
-{
-    for (int i = 0; i < MC_TILED_SURFACE_MAX; i++) {
-        if (s->tiled_surfaces[i].active && s->tiled_surfaces[i].base == base) {
-            s->tiled_surfaces[i].active = false;
-            static int unreg_log_count = 0;
-            if (unreg_log_count < 20) {
-                blit_path_log("SURFACE_UNREG",
-                    "slot=%d base=0x%06x was=%s",
-                    i, base, s->tiled_surfaces[i].label);
-                unreg_log_count++;
-            }
-        }
-    }
-}
-
-/*
  * Look up whether a linear VRAM address falls within a registered tiled surface.
  * If so, returns the surface slot index and sets *surf_base and *surf_pitch.
  * Returns -1 if the address is not in any tiled surface (→ linear access).
@@ -4218,7 +4197,8 @@ static inline void mc_vram_write32(PPCMacGPUState *s, uint8_t *vram,
             static int vram_watch_log = 0;
             static int zero_write_log = 0;
             /* Log first 50 writes, plus up to 20 zero-value writes */
-            if (vram_watch_log < 50 || (value == 0 && zero_write_log < 20)) {
+            if (gpu_diag_on() &&
+                (vram_watch_log < 50 || (value == 0 && zero_write_log < 20))) {
                 fprintf(stderr, "[VRAM_WATCH] mc_vram_write32 phys=0x%06llx "
                         "linear=0x%06llx val=0x%08x tiled=%d\n",
                         (unsigned long long)phys_addr,
@@ -4580,7 +4560,7 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
                     if (dst_pitch != s->disp.stride ||
                         !s->disp_stride_override_active) {
                         static int srt_so_log = 0;
-                        if (srt_so_log < 20) {
+                        if (gpu_diag_on() && srt_so_log < 20) {
                             fprintf(stderr,
                                 "[STRIDE_CHANGE] MMIO_SRT: "
                                 "override %s %u -> %u\n",
@@ -4826,7 +4806,7 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
             if (dst_pitch != s->disp.stride ||
                 !s->disp_stride_override_active) {
                 static int mmio_nosrt_so = 0;
-                if (mmio_nosrt_so < 20) {
+                if (gpu_diag_on() && mmio_nosrt_so < 20) {
                     fprintf(stderr,
                         "[STRIDE_CHANGE] MMIO_NOSRT: "
                         "override %s %u -> %u\n",
@@ -5228,7 +5208,7 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
             if (!s->disp_stride_override_active ||
                 s->disp_stride_override_value != dst_pitch) {
                 static int mmio_so_log = 0;
-                if (mmio_so_log < 20) {
+                if (gpu_diag_on() && mmio_so_log < 20) {
                     fprintf(stderr,
                         "[STRIDE_CHANGE] MMIO_2D: "
                         "override %s %u -> %u\n",
@@ -7264,7 +7244,6 @@ static void ppc_mac_gpu_dispatch_3d_draw(PPCMacGPUState *s,
         static int gate_logged = 0;
         static uint64_t first_real_blend_at = 0;
         static uint64_t first_real_tex_at = 0;
-        static int unique_targets = 0;
         static uint32_t seen_targets[32];
         static int seen_target_count = 0;
 
@@ -8186,7 +8165,7 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                                 if (!s->disp_stride_override_active ||
                                     s->disp_stride_override_value != dst_pitch) {
                                     static int so_log = 0;
-                                    if (so_log < 20) {
+                                    if (gpu_diag_on() && so_log < 20) {
                                         fprintf(stderr,
                                             "[STRIDE_CHANGE] PM4_BBM: "
                                             "override %s %u -> %u\n",
@@ -9408,7 +9387,7 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
                 qemu_log("[QE_GATE_READ] reg=0x%04x value=0x%08x "
                          "context=idle_poll sequence_id=%d "
                          "note=RBBM_STATUS_always_idle\n",
-                         (uint32_t)addr, val, rbbm_read_count);
+                         (uint32_t)addr, (uint32_t)val, rbbm_read_count);
             }
         }
         break;
@@ -9787,7 +9766,7 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
             if (val != last[scratch_idx] && n++ < 40) {
                 last[scratch_idx] = val;
                 fprintf(stderr, "ppc-mac-gpu fence: guest reads reg%d = %u\n",
-                        scratch_idx, val);
+                        scratch_idx, (uint32_t)val);
             }
         }
         gpu_debug_log("STATUS_RD SCRATCH_REG%d -> 0x%08x",
@@ -9805,7 +9784,7 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
                 qemu_log("[QE_GATE_READ] reg=0x%04x value=0x%08x "
                          "context=scratch_poll sequence_id=%d "
                          "note=SCRATCH_REG%d_fence_check\n",
-                         (uint32_t)addr, val, scratch_read_count,
+                         (uint32_t)addr, (uint32_t)val, scratch_read_count,
                          scratch_idx);
             }
         }
@@ -10181,10 +10160,6 @@ static void ppc_mac_gpu_tcl_port_write(PPCMacGPUState *s, hwaddr addr,
     case 0x2204:    /* SE_TCL_VECTOR_DATA_REG */
         s->regs.tcl_vec[s->regs.tcl_vec_addr & 0x7ff][s->regs.tcl_vec_comp] = val;
         if (++s->regs.tcl_vec_comp == 4) {
-            uint32_t a = s->regs.tcl_vec_addr & 0x7ff;
-            /* POWEREMU_VP_TRACE: the vertex programs the guest uploads.
-             * Instructions sit at 0x080-0x0BF and 0x180-0x1BF, four dwords
-             * each; everything else here is constants, matrices or lights. */
             s->regs.tcl_vec_comp = 0;
             s->regs.tcl_vec_addr += s->regs.tcl_vec_stride ? s->regs.tcl_vec_stride : 1;
         }
@@ -11109,35 +11084,6 @@ static const MemoryRegionOps ppc_mac_gpu_mmio_ops = {
  * ROM BAR - traced expansion ROM access
  * ======================================================================== */
 
-static uint64_t ppc_mac_gpu_rom_read(void *opaque, hwaddr addr, unsigned size)
-{
-    PPCMacGPUState *s = opaque;
-    uint64_t val = 0;
-
-    if (addr + size <= s->rom_size) {
-        memcpy(&val, s->rom_data + addr, size);
-    }
-    gpu_debug_log("ROM_RD offset=0x%04"HWADDR_PRIx" size=%u val=0x%"PRIx64,
-                  addr, size, val);
-    return val;
-}
-
-static void ppc_mac_gpu_rom_write(void *opaque, hwaddr addr,
-                                   uint64_t val, unsigned size)
-{
-    /* ROM is read-only, ignore writes */
-}
-
-static const MemoryRegionOps ppc_mac_gpu_rom_ops = {
-    .read = ppc_mac_gpu_rom_read,
-    .write = ppc_mac_gpu_rom_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid = {
-        .min_access_size = 1,
-        .max_access_size = 4,
-    },
-};
-
 /* ========================================================================
  * Byte-swapped VRAM aperture (upper half of BAR0)
  *
@@ -11149,66 +11095,6 @@ static const MemoryRegionOps ppc_mac_gpu_rom_ops = {
  * The byte-swapped aperture occupies the upper half of BAR0.
  * The lower half provides direct (non-swapped) access.
  * ======================================================================== */
-
-static uint64_t ppc_mac_gpu_vram_bswap_read(void *opaque, hwaddr addr,
-                                              unsigned size)
-{
-    PPCMacGPUState *s = opaque;
-    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
-    uint64_t val = 0;
-
-    if (addr + size > s->vram_size) {
-        return 0;
-    }
-
-    switch (size) {
-    case 1:
-        /* Byte access: XOR address bits [1:0] for BE byte lane swap */
-        val = vram[addr ^ 3];
-        break;
-    case 2: {
-        /* 16-bit: swap within 32-bit word */
-        hwaddr swapped = addr ^ 2;
-        val = lduw_le_p(vram + swapped);
-        break;
-    }
-    case 4:
-        /* 32-bit: byte-swap the whole dword */
-        val = bswap32(ldl_le_p(vram + addr));
-        break;
-    default:
-        break;
-    }
-    return val;
-}
-
-static void ppc_mac_gpu_vram_bswap_write(void *opaque, hwaddr addr,
-                                           uint64_t val, unsigned size)
-{
-    PPCMacGPUState *s = opaque;
-    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
-
-    if (addr + size > s->vram_size) {
-        return;
-    }
-
-    switch (size) {
-    case 1:
-        vram[addr ^ 3] = (uint8_t)val;
-        break;
-    case 2: {
-        hwaddr swapped = addr ^ 2;
-        stw_le_p(vram + swapped, (uint16_t)val);
-        break;
-    }
-    case 4:
-        stl_le_p(vram + addr, bswap32((uint32_t)val));
-        break;
-    default:
-        break;
-    }
-    memory_region_set_dirty(&s->vram, addr, size);
-}
 
 /*
  * R300 aperture 1.  A Radeon's frame-buffer BAR holds two apertures onto
@@ -11487,20 +11373,6 @@ static const MemoryRegionOps r300_ap1_ops = {
     .endianness = DEVICE_BIG_ENDIAN,
     .valid = { .min_access_size = 1, .max_access_size = 4 },
     .impl = { .min_access_size = 1, .max_access_size = 4 },
-};
-
-static const MemoryRegionOps ppc_mac_gpu_vram_bswap_ops = {
-    .read = ppc_mac_gpu_vram_bswap_read,
-    .write = ppc_mac_gpu_vram_bswap_write,
-    .endianness = DEVICE_BIG_ENDIAN,
-    .valid = {
-        .min_access_size = 1,
-        .max_access_size = 4,
-    },
-    .impl = {
-        .min_access_size = 1,
-        .max_access_size = 4,
-    },
 };
 
 /* ========================================================================
@@ -12102,7 +11974,7 @@ static char *ppc_mac_gpu_get_trace(Object *obj, Error **errp)
         "POWEREMU_STALL_TRACE", "POWEREMU_FENCE_TRACE", "POWEREMU_TEX_TRACE",
         "POWEREMU_VP_TRACE", "POWEREMU_POLL_TRACE",
         /* The direct R200 path logs per draw only under these. */
-        "PPCGPU_SEQ_LOG", "PPCGPU_DIAG", "PPCGPU_WINDOWS",
+        "PPCGPU_SEQ_LOG", "PPCGPU_DIAG", "PPCGPU_WINDOWS", "PPCGPU_RATE",
     };
     GString *out = g_string_new(NULL);
     int i;
