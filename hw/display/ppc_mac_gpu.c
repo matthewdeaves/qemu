@@ -5004,6 +5004,14 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
         }
     }
 
+    /*
+     * Tiger's driver re-sends unchanged textures on every bind; if the
+     * blit below never actually changes VRAM there's nothing to mark
+     * dirty, and skipping that keeps the Metal texture cache from
+     * re-hashing (and re-uploading) something byte-identical.
+     */
+    bool agp_same = false;
+
     if (rop3 == 0xCC) {
         /* SRC copy blit — MC helpers handle tiling transparently */
         if (src_is_gart || src_is_agp) {
@@ -5038,9 +5046,30 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
             uint32_t distinct_pixels = 0;
             uint32_t prev_pixel_val = 0;
             bool prev_set = false;
+            bool vram_changed = false;
 
             /* Phase A deep: log AGP translate details for first upload */
             static int agp_detail_log = 0;
+
+            /*
+             * Translating and mapping once per 4 KB page (instead of once
+             * per pixel) removes a page-table read and an address_space
+             * lookup from the hot path; Quake's lightmap uploads spend
+             * 6-13% of the guest CPU thread here.  GART addresses are only
+             * safe to bucket by gpu_addr >> 12 when AIC_LO_ADDR is itself
+             * page aligned — ppc_mac_gpu_gart_translate() computes its page
+             * index from (gpu_addr - aic_lo_addr), so an unaligned base
+             * would shift the GART's page boundaries off gpu_addr's own.
+             * AGP's aperture is always 64 KB aligned, so AGP is always
+             * safe to cache this way.
+             */
+            bool page_cacheable = !src_is_gart ||
+                                   !(s->regs.aic_lo_addr & 0xFFF);
+            uint32_t cur_page = UINT32_MAX;
+            bool page_ok = false;
+            hwaddr page_phys = 0;
+            void *page_map = NULL;
+            hwaddr page_map_len = 0;
 
             for (uint32_t row = 0; row < blit_h; row++) {
                 uint32_t row_gpu_addr = src_offset +
@@ -5053,15 +5082,61 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
                     uint32_t pixel = 0;
                     bool xlated = false;
 
-                    if (src_is_gart) {
+                    if (page_cacheable) {
+                        uint32_t page = gpu_addr >> 12;
+                        if (page != cur_page) {
+                            if (page_map) {
+                                address_space_unmap(as, page_map,
+                                                    page_map_len, false, 0);
+                                page_map = NULL;
+                            }
+                            if (src_is_gart) {
+                                page_ok = ppc_mac_gpu_gart_translate(
+                                    s, page << 12, &page_phys);
+                            } else {
+                                page_ok = ppc_mac_gpu_agp_translate(
+                                    s, page << 12, &page_phys);
+                            }
+                            if (page_ok) {
+                                page_map_len = 4096;
+                                page_map = address_space_map(
+                                    as, page_phys, &page_map_len, false,
+                                    MEMTXATTRS_UNSPECIFIED);
+                            } else {
+                                page_map_len = 0;
+                            }
+                            cur_page = page;
+                        }
+                        xlated = page_ok;
+                        phys = page_phys + (gpu_addr & 0xFFF);
+                        if (xlated) {
+                            if (page_map &&
+                                (gpu_addr & 0xFFF) + 4 <= page_map_len) {
+                                memcpy(&pixel,
+                                       (uint8_t *)page_map + (gpu_addr & 0xFFF),
+                                       4);
+                            } else {
+                                address_space_read(as, phys,
+                                                   MEMTXATTRS_UNSPECIFIED,
+                                                   &pixel, 4);
+                            }
+                        }
+                    } else if (src_is_gart) {
                         xlated = ppc_mac_gpu_gart_translate(s, gpu_addr, &phys);
+                        if (xlated) {
+                            address_space_read(as, phys,
+                                               MEMTXATTRS_UNSPECIFIED,
+                                               &pixel, 4);
+                        }
                     } else {
                         xlated = ppc_mac_gpu_agp_translate(s, gpu_addr, &phys);
+                        if (xlated) {
+                            address_space_read(as, phys,
+                                               MEMTXATTRS_UNSPECIFIED,
+                                               &pixel, 4);
+                        }
                     }
                     if (xlated) {
-                        address_space_read(as, phys,
-                                           MEMTXATTRS_UNSPECIFIED,
-                                           &pixel, 4);
                         /*
                          * VRAM holds what the CPU sees through its
                          * byte-swapping aperture (32-bit swap for 32bpp,
@@ -5107,9 +5182,18 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
                     uint64_t dst_linear = (uint64_t)dst_offset +
                         (uint64_t)(dst_y + row) * dst_pitch +
                         (uint64_t)(dst_x + col) * bpp;
+                    if (!vram_changed &&
+                        mc_vram_read32(s, vram, dst_linear) != pixel) {
+                        vram_changed = true;
+                    }
                     mc_vram_write32(s, vram, dst_linear, pixel);
                 }
             }
+            if (page_map) {
+                address_space_unmap(as, page_map, page_map_len, false, 0);
+                page_map = NULL;
+            }
+            agp_same = !vram_changed;
 
             /* Phase A+B logging */
             if (wup_log) {
@@ -5189,7 +5273,7 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
         uint64_t dirty_len = (blit_h > 1)
             ? (uint64_t)(blit_h - 1) * dst_pitch + (uint64_t)blit_w * bpp
             : (uint64_t)blit_w * bpp;
-        if (dirty_start + dirty_len <= s->vram_size) {
+        if (!agp_same && dirty_start + dirty_len <= s->vram_size) {
             memory_region_set_dirty(&s->vram, dirty_start, dirty_len);
         }
         s->display_invalid = true;
