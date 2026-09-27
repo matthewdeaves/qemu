@@ -7056,8 +7056,9 @@ static id<MTLSamplerState> r300_sampler(id<MTLDevice> dev, uint32_t f0,
     d.lodMaxClamp = levels ? levels - 1 : 0;
     s = [dev newSamplerStateWithDescriptor:d];
     [d release];
-    /* Eight probes found no room: evict the slot after them. */
-    [g_r300_samplers[slot].s release];
+    /* Eight probes found no room: evict the slot after them.  Autoreleased,
+     * not released: this draw may already hold it for another unit. */
+    [g_r300_samplers[slot].s autorelease];
     g_r300_samplers[slot].key = key;
     g_r300_samplers[slot].s = s;           /* the table owns the reference */
     return s;
