@@ -7677,14 +7677,16 @@ static uint64_t r300_hash(const uint8_t *p, size_t n)
  * unit's layout and a hash of its bytes, so unchanged textures cost a
  * hash, not an upload.
  */
-#define R300_TCACHE 48
+/* 48 thrashed: a Quake map binds more textures than that. */
+#define R300_TCACHE 256
 typedef struct R300TexCacheKey {
     uint32_t addr, format, kind, width, height, depth, dim, levels, pitch;
     uint32_t host;
-    uint64_t hash;
 } R300TexCacheKey;
 static struct {
     R300TexCacheKey key;
+    uint64_t hash;                  /* of the texels it was made from */
+    uint32_t gen;                   /* VRAM write generation it was checked at */
     id<MTLTexture> tex;
     uint64_t used;
 } g_r300_tcache[R300_TCACHE];
@@ -7754,23 +7756,52 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
         r300_metal_warn(64, "cube map with non-square faces");
         return nil;
     }
-    /* The CPU reads the texels: finish pending draws that write them. */
-    if (!td->host_data && r200_batch_conflict(lo, hi, NULL)) {
+    /*
+     * The CPU reads the texels: finish pending draws that write them, in
+     * any batch still in flight, not just the open one.  A split leaves
+     * earlier batches running, and the shared event orders the GPU, not
+     * this read; hashing half-written texels would also be recorded as
+     * checked at this write generation and never looked at again.
+     */
+    if (!td->host_data && metal_range_busy_r200(st, lo, hi, false)) {
         metal_flush_r200(st);
     }
 
     R300TexCacheKey key = { td->gpu_addr, td->format, td->kind, td->width, td->height,
                             td->depth, td->dim, td->levels, td->pitch_bytes,
-                            td->host_data != NULL, r300_hash(src, td->size_bytes) };
-    int lru = 0;
+                            td->host_data != NULL };
+    /* A VRAM texture nothing has written since it was last checked is used
+     * as it is; otherwise the texels are hashed and compared. */
+    bool known = !td->host_data && td->write_gen;
+    uint64_t hash = 0;
+    bool hashed = false;
+    int lru = 0, hit = -1;
     for (int i = 0; i < R300_TCACHE; i++) {
-        if (g_r300_tcache[i].tex && !memcmp(&g_r300_tcache[i].key, &key, sizeof(key))) {
-            g_r300_tcache[i].used = ++g_r300_tcache_clock;
-            return g_r300_tcache[i].tex;
+        if (g_r300_tcache[i].tex && g_r300_tcache[i].key.addr == key.addr &&
+            !memcmp(&g_r300_tcache[i].key, &key, sizeof(key))) {
+            hit = i;
+            break;
         }
         if (g_r300_tcache[i].used < g_r300_tcache[lru].used) {
             lru = i;
         }
+    }
+    if (hit >= 0) {
+        if (known && g_r300_tcache[hit].gen >= td->write_gen) {
+            g_r300_tcache[hit].used = ++g_r300_tcache_clock;
+            return g_r300_tcache[hit].tex;
+        }
+        hash = r300_hash(src, td->size_bytes);
+        hashed = true;
+        if (g_r300_tcache[hit].hash == hash) {
+            g_r300_tcache[hit].gen = td->write_gen;
+            g_r300_tcache[hit].used = ++g_r300_tcache_clock;
+            return g_r300_tcache[hit].tex;
+        }
+        lru = hit;                      /* same texture, new texels */
+    }
+    if (!hashed) {
+        hash = r300_hash(src, td->size_bytes);
     }
 
     MTLTextureDescriptor *d = [[MTLTextureDescriptor alloc] init];
@@ -7810,6 +7841,8 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
     }
     [g_r300_tcache[lru].tex release];
     g_r300_tcache[lru].key = key;
+    g_r300_tcache[lru].hash = hash;
+    g_r300_tcache[lru].gen = known ? td->write_gen : 0;
     g_r300_tcache[lru].tex = t;
     g_r300_tcache[lru].used = ++g_r300_tcache_clock;
     return t;
@@ -7840,8 +7873,10 @@ static id<MTLTexture> r300_texture_raw(PPCMacGPUMetalState *st, id<MTLDevice> de
             return r200_view(st, k, rpf, false);
         }
     }
-    if (!td->host_data && r200_batch_conflict(td->gpu_addr, (uint64_t)td->gpu_addr +
-                                              td->size_bytes, NULL)) {
+    /* The CPU copies the texels: wait for any batch in flight writing them
+     * (see r300_texture_full). */
+    if (!td->host_data && metal_range_busy_r200(st, td->gpu_addr,
+                              (uint64_t)td->gpu_addr + td->size_bytes, false)) {
         metal_flush_r200(st);
     }
     const uint8_t *src = td->host_data ? td->host_data : vram_ptr + td->gpu_addr;

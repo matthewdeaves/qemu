@@ -37,6 +37,7 @@
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "system/address-spaces.h"
+#include "system/physmem.h"
 #include "hw/display/ppc_mac_gpu.h"
 #include "ppc_mac_gpu_3d_regs.h"
 #include "ppc_mac_gpu_renderer.h"
@@ -1500,9 +1501,13 @@ static void ppc_mac_gpu_bswap_line32(uint32_t *dst, const uint32_t *src,
     }
 }
 
+static void r300_vram_fold(PPCMacGPUState *s);
+
 static void ppc_mac_gpu_display_update(void *opaque)
 {
     PPCMacGPUState *s = opaque;
+
+    r300_vram_fold(s);
 
     /* A machine that has just been woken: give the window the pointer the
      * sleeping one had (see ppc_mac_gpu_post_load). */
@@ -2552,6 +2557,66 @@ static FILE *r300_drawlog(void)
     return f;
 }
 
+/*
+ * The newest write generation over VRAM [addr, addr + len), for the
+ * renderer's texture cache: it rehashes a cached texture only when this
+ * is newer than when it last checked, instead of on every bind (7% of the
+ * vCPU in Quake).  Writes come from the dirty log: the guest CPU's through
+ * the BAR, and the device's own (memory_region_set_dirty, which every
+ * blit, upload and draw target calls).
+ *
+ * Clearing the log resets the TLB, which cost 30% of the vCPU done per
+ * texture per draw, so it is only read here: a page written since the
+ * last fold answers 0 (unknown: hash it), and r300_vram_fold(), once a
+ * display refresh, clears the whole log and records every dirty page with
+ * a new generation.
+ */
+static uint32_t r300_vram_write_gen(PPCMacGPUState *s, uint64_t addr, uint64_t len)
+{
+    ram_addr_t ram = memory_region_get_ram_addr(&s->vram);
+    uint32_t gen = 0;
+
+    if (!len || addr >= s->vram_size) {
+        return 0;
+    }
+    len = MIN(len, s->vram_size - addr);
+    for (uint64_t p = addr >> 12; p <= (addr + len - 1) >> 12; p++) {
+        if (physical_memory_get_dirty_flag(ram + (p << 12), DIRTY_MEMORY_VGA)) {
+            return 0;
+        }
+        gen = MAX(gen, s->vram_page_gen[p]);
+    }
+    return gen;
+}
+
+/* Fold the VRAM dirty log into the page generations (r300_vram_write_gen). */
+static void r300_vram_fold(PPCMacGPUState *s)
+{
+    const uint64_t block = 64 * 4096;
+    uint32_t gen = 0;
+
+    if (!s->vram_page_gen) {
+        return;
+    }
+    DirtyBitmapSnapshot *snap = memory_region_snapshot_and_clear_dirty(
+        &s->vram, 0, s->vram_size, DIRTY_MEMORY_VGA);
+    for (uint64_t b = 0; b < s->vram_size; b += block) {
+        uint64_t bl = MIN(block, s->vram_size - b);
+        if (!memory_region_snapshot_get_dirty(&s->vram, snap, b, bl)) {
+            continue;
+        }
+        for (uint64_t a = b; a < b + bl; a += 4096) {
+            if (memory_region_snapshot_get_dirty(&s->vram, snap, a, 4096)) {
+                if (!gen) {
+                    gen = ++s->vram_gen;
+                }
+                s->vram_page_gen[a >> 12] = gen;
+            }
+        }
+    }
+    g_free(snap);
+}
+
 static void r300_drawlog_draw(PPCMacGPUState *s, uint32_t opcode,
                               const uint32_t *d, uint32_t body_dw)
 {
@@ -3035,6 +3100,13 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
     }
     if (s->renderer && s->renderer->draw_r300) {
         bool need_bql = !bql_locked();
+
+        for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
+            R300TexDesc *td = &pkt.tex[t];
+            if (td->bound && !td->host_data) {
+                td->write_gen = r300_vram_write_gen(s, td->gpu_addr, td->size_bytes);
+            }
+        }
 
         if (need_bql) {
             bql_lock();
@@ -11619,8 +11691,11 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
     pci_register_bar(dev, PPC_MAC_GPU_IO_BAR,
                      PCI_BASE_ADDRESS_SPACE_IO, &s->io);
 
-    /* Enable VRAM dirty tracking for display updates */
+    /* VRAM dirty tracking: the texture cache's record of what was written
+     * (r300_vram_write_gen) */
     memory_region_set_log(&s->vram, true, DIRTY_MEMORY_VGA);
+    s->vram_page_gen = g_new0(uint32_t, s->vram_size >> 12);
+    s->vram_gen = 1;
 
     /* Initialize VBlank timer */
     timer_init_ns(&s->vblank_timer, QEMU_CLOCK_VIRTUAL,

@@ -689,6 +689,10 @@ struct PPCMacGPUState {
     uint32_t r300_aic_pt_base;  /* PCI GART table base (0x0AB0) */
     uint32_t vram_size_mb;      /* VRAM size in megabytes */
     uint64_t vram_size;         /* VRAM size in bytes (computed) */
+    /* Per 4 KB page of VRAM, the generation of the last write seen through
+     * the dirty log (r300_vram_write_gen); vram_gen is the newest. */
+    uint32_t *vram_page_gen;
+    uint32_t vram_gen;
 
     /* Device state */
     uint8_t mode;               /* VGA or extended mode */

@@ -81,6 +81,10 @@ typedef struct R300TexDesc {
     uint32_t lvl_pitch[R300_TEX_MAX_LEVELS];    /* bytes per row (of blocks) */
     uint32_t lvl_rows[R300_TEX_MAX_LEVELS];     /* rows (of blocks) per face/slice */
     uint32_t size_bytes;        /* the whole chain */
+    /* Newest VRAM write generation over the chain, set by the device
+     * before drawing (0: unknown): a cached copy checked at this
+     * generation or later is still good without rehashing. */
+    uint32_t write_gen;
 } R300TexDesc;
 
 /* Width, height and depth (slices; 6 faces for a cube) of mip level l. */
