@@ -387,7 +387,8 @@ int main(void)
             Pass ps = { { rgba8(0) }, 1 };
             run(&ps, p, &u, v, 6);
             px(ps.cb[0], 5, 5, o);
-            CHECK(NEAR(o[0], 64, 1.5f) && o[1] == 0 && NEAR(o[2], 191, 1.5f), "fog %u %u %u",
+            /* a fog amount of 0.25 keeps 3/4 of the colour */
+            CHECK(NEAR(o[0], 191, 1.5f) && o[1] == 0 && NEAR(o[2], 64, 1.5f), "fog %u %u %u",
                   o[0], o[1], o[2]);
 
             u = base_uniforms();
