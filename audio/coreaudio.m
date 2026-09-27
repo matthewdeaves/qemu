@@ -32,6 +32,7 @@
 #include "qemu/audio.h"
 #include "qom/object.h"
 #include "audio_int.h"
+#include "trace.h"
 
 #define TYPE_AUDIO_COREAUDIO "audio-coreaudio"
 OBJECT_DECLARE_SIMPLE_TYPE(AudioCoreaudio, AUDIO_COREAUDIO)
@@ -330,6 +331,7 @@ static OSStatus out_device_ioproc(
 
     /* if there are not enough samples, set signal and return */
     if (pending_frames < frame_size) {
+        trace_coreaudio_underrun(pending_frames, frame_size);
         inInputTime = 0;
         coreaudio_voice_out_buf_unlock(core, "out_device_ioproc(empty)");
         return 0;
