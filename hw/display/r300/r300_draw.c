@@ -1303,6 +1303,13 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
      * the earlier result (slot + 1, 0 for none). */
     R300Vertex *xv = calloc(nsrc ? nsrc : 1, sizeof(R300Vertex));
     float (*outs)[R300_PVS_NUM_OUTPUTS][4] = calloc(nsrc ? nsrc : 1, sizeof(*outs));
+    if (!xv || !outs) {
+        *err = "out of memory";
+        free(outs);
+        free(xv);
+        free(order);
+        return false;
+    }
     uint32_t seen_idx[64], seen_slot[64] = { 0 };
     for (uint32_t i = 0, j = 0; i < n && j < nsrc; i++, j++) {
         float in[R300_PVS_NUM_INPUTS][4];
@@ -1420,6 +1427,15 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
 
     list = malloc(sizeof(uint32_t) * (n * 3 + 6));
     prov = malloc(sizeof(R300Prov) * (n * 2 + 2));
+    if (!list || !prov) {
+        *err = "out of memory";
+        free(prov);
+        free(list);
+        free(outs);
+        free(xv);
+        free(order);
+        return false;
+    }
     uint32_t cls;
     nidx = r300_assemble_prov(prim, n, list, &cls, prov);
     if (!nidx) {
@@ -1502,6 +1518,10 @@ bool r300_draw_build(const R300State *st, const R300Arrays *arr,
         return false;
     }
     order = malloc(sizeof(uint32_t) * n);
+    if (!order) {
+        *err = "out of memory";
+        return false;
+    }
     if (opcode == 0x36) {                       /* DRAW_INDX_2, inline */
         bool i32 = (vf >> 11) & 1;
         for (uint32_t i = 0; i < n; i++) {
@@ -1585,10 +1605,19 @@ bool r300_draw_build_indexed(const R300State *st, const R300Arrays *arr,
         return false;
     }
     sw = malloc(sizeof(uint32_t) * (idx->ndw ? idx->ndw : 1));
+    if (!sw) {
+        *err = "out of memory";
+        return false;
+    }
     for (uint32_t k = 0; k < idx->ndw; k++) {
         sw[k] = vc_swap(idx->dw[k], swap);
     }
     order = malloc(sizeof(uint32_t) * n);
+    if (!order) {
+        *err = "out of memory";
+        free(sw);
+        return false;
+    }
     for (uint32_t i = 0; i < n; i++) {
         order[i] = r300_index_at(sw, idx->ndw, i32, i);
     }

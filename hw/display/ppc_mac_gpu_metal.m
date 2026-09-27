@@ -991,6 +991,12 @@ static void *metal_init(uint8_t *vram_ptr, uint64_t vram_size)
          * If zero-copy VRAM was pre-allocated, reuse its MTLDevice and
          * MTLBuffer.  Otherwise create a new device (legacy path).
          */
+        /* device_owned: only the legacy path's MTLCreateSystemDefaultDevice()
+         * gives us a +1 reference to release on a later failure.  The
+         * zero-copy path borrows g_metal_vram_alloc->device, which other
+         * code still holds and must not be released here. */
+        bool device_owned = false;
+
         if (g_metal_vram_alloc &&
             [g_metal_vram_alloc->vramBuffer contents] == vram_ptr) {
             /* Zero-copy path: reuse device and buffer from early alloc */
@@ -1003,6 +1009,7 @@ static void *metal_init(uint8_t *vram_ptr, uint64_t vram_size)
             /* Legacy path: create new device (VRAM is normal QEMU RAM) */
             st->device = MTLCreateSystemDefaultDevice();
             st->vramBuffer = nil;
+            device_owned = true;
         }
 
         if (!st->device) {
@@ -1017,6 +1024,9 @@ static void *metal_init(uint8_t *vram_ptr, uint64_t vram_size)
         if (!st->commandQueue) {
             qemu_log_mask(LOG_UNIMP,
                           "ppc-mac-gpu-metal: failed to create command queue\n");
+            if (device_owned) {
+                [st->device release];
+            }
             g_free(st);
             return NULL;
         }
@@ -1030,6 +1040,10 @@ static void *metal_init(uint8_t *vram_ptr, uint64_t vram_size)
             qemu_log_mask(LOG_UNIMP,
                           "ppc-mac-gpu-metal: shader compilation failed: %s\n",
                           error ? [[error localizedDescription] UTF8String] : "unknown");
+            [st->commandQueue release];
+            if (device_owned) {
+                [st->device release];
+            }
             g_free(st);
             return NULL;
         }
@@ -1040,6 +1054,13 @@ static void *metal_init(uint8_t *vram_ptr, uint64_t vram_size)
         if (!vertexFunc || !fragmentFunc) {
             qemu_log_mask(LOG_UNIMP,
                           "ppc-mac-gpu-metal: shader function lookup failed\n");
+            [vertexFunc release];
+            [fragmentFunc release];
+            [library release];
+            [st->commandQueue release];
+            if (device_owned) {
+                [st->device release];
+            }
             g_free(st);
             return NULL;
         }
@@ -1083,6 +1104,15 @@ static void *metal_init(uint8_t *vram_ptr, uint64_t vram_size)
             qemu_log_mask(LOG_UNIMP,
                           "ppc-mac-gpu-metal: pipeline creation failed: %s\n",
                           error ? [[error localizedDescription] UTF8String] : "unknown");
+            [pipeDesc release];
+            [vtxDesc release];
+            [vertexFunc release];
+            [fragmentFunc release];
+            [library release];
+            [st->commandQueue release];
+            if (device_owned) {
+                [st->device release];
+            }
             g_free(st);
             return NULL;
         }
