@@ -1324,8 +1324,20 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
      * An indexed draw names most vertices more than once; the fetch and
      * the vertex program depend only on the index, so a repeat copies
      * the earlier result (slot + 1, 0 for none). */
-    R300Vertex *xv = calloc(nsrc ? nsrc : 1, sizeof(R300Vertex));
-    float (*outs)[R300_PVS_NUM_OUTPUTS][4] = calloc(nsrc ? nsrc : 1, sizeof(*outs));
+    /*
+     * malloc, not calloc: xv.aux[1..3] and xv.ucp[6..7] are never written
+     * (aux.x is the only meaningful component; real R300 hardware has only
+     * 6 user clip planes, so the copy loop into the vertex-shader output
+     * never reaches index 6/7 either) and outs[j]'s PVS-program case only
+     * writes the outputs the route registers actually read back, by the
+     * same driver construction real hardware relies on. Verified by
+     * poison-filling both allocations (0xAA, not zero) and running the
+     * full offline suite (tests/r300/run.sh, Metal-backed rendering
+     * included) clean -- qemu#4.
+     */
+    uint32_t xv_n = nsrc ? nsrc : 1;
+    R300Vertex *xv = malloc(xv_n * sizeof(R300Vertex));
+    float (*outs)[R300_PVS_NUM_OUTPUTS][4] = malloc(xv_n * sizeof(*outs));
     if (!xv || !outs) {
         *err = "out of memory";
         free(outs);
