@@ -1266,26 +1266,35 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
     f.immd = immd;
     f.immd_dw = immd_dw;
 
-    /* Vertex program */
-    for (int i = 0; i < 256; i++) {
-        memcpy(consts[i], &st->pvs_mem[(R300_PVS_CONST_START + (cc & 0xFF) + i) * 4],
-               sizeof(consts[i]));
-        if (R300_PVS_CONST_START + (cc & 0xFF) + i + 1 >= R300_PVS_MEM_VECS) {
-            break;
-        }
-    }
-    prog.code = &st->pvs_mem[R300_PVS_CODE_START * 4];
-    prog.first_inst = cntl0 & 0x3FF;
-    prog.last_inst = (cntl0 >> 20) & 0x3FF;
-    prog.consts = (const float (*)[4])consts;
-    prog.max_const = (cc >> 16) & 0xFF;
-    prog.fc_opc = r300_reg(st, VAP_PVS_FLOW_CNTL_OPC);
-    for (int i = 0; i < 16; i++) {
-        prog.fc_addrs[i] = r300_reg(st, VAP_PVS_FLOW_CNTL_ADDRS_0 + 4 * i);
-        prog.fc_loop[i] = r300_reg(st, VAP_PVS_FLOW_CNTL_LOOP_INDEX_0 + 4 * i);
-    }
-
+    /*
+     * Vertex program setup: bypass draws never read prog/consts (the
+     * vertex loop below takes the memcpy(out, in, ...) arm instead of
+     * r300_pvs_run_prepared), so skip building them entirely. Where a
+     * program does run, copy only as many constant vectors as it can
+     * read: r300_pvs.c bounds every constant read by max_const ("reads
+     * beyond this return 0"), so anything past it is never looked at,
+     * and a program using a handful of constants (typical) no longer
+     * pays for copying all 256 (4 KB) of them every draw.
+     */
     if (!bypass) {
+        uint32_t max_const = (cc >> 16) & 0xFF;
+        for (uint32_t i = 0; i <= max_const; i++) {
+            memcpy(consts[i], &st->pvs_mem[(R300_PVS_CONST_START + (cc & 0xFF) + i) * 4],
+                   sizeof(consts[i]));
+            if (R300_PVS_CONST_START + (cc & 0xFF) + i + 1 >= R300_PVS_MEM_VECS) {
+                break;
+            }
+        }
+        prog.code = &st->pvs_mem[R300_PVS_CODE_START * 4];
+        prog.first_inst = cntl0 & 0x3FF;
+        prog.last_inst = (cntl0 >> 20) & 0x3FF;
+        prog.consts = (const float (*)[4])consts;
+        prog.max_const = max_const;
+        prog.fc_opc = r300_reg(st, VAP_PVS_FLOW_CNTL_OPC);
+        for (int i = 0; i < 16; i++) {
+            prog.fc_addrs[i] = r300_reg(st, VAP_PVS_FLOW_CNTL_ADDRS_0 + 4 * i);
+            prog.fc_loop[i] = r300_reg(st, VAP_PVS_FLOW_CNTL_LOOP_INDEX_0 + 4 * i);
+        }
         r300_pvs_prepare(&prepared, &prog);
     }
 
