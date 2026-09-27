@@ -24,6 +24,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/main-loop.h"
 
 #ifdef CONFIG_DARWIN
 
@@ -6911,6 +6912,62 @@ typedef struct R300Pipe {
 } R300Pipe;
 static GHashTable *g_r300_pipes;        /* uint64 hash -> R300Pipe chain */
 static unsigned g_r300_npipes;
+
+/*
+ * qemu#10: a disk-backed cache of compiled pipelines, so a shader this
+ * exact QEMU build has ever compiled before -- on any VM, any prior run --
+ * loads back near-instantly instead of paying the compile cost again.
+ * g_r300_pipes above only helps *within* one process's lifetime; alephone's
+ * shader renderer needs on the order of a hundred distinct fragment
+ * programs before its first frame can complete, and every fresh guest
+ * boot (a fresh QEMU process) starts that cache empty. The archive is
+ * content-addressed by Metal itself (keyed off the compiled functions),
+ * so a changed MSL source for what used to be "the same" shader just
+ * misses and recompiles -- no manual versioning needed. Best-effort:
+ * any failure to load, add to, or save the archive falls back to
+ * compiling without it, same as before this existed.
+ */
+static id<MTLBinaryArchive> g_r300_archive;
+static bool g_r300_archive_tried;
+static NSURL *g_r300_archive_url;
+
+static id<MTLBinaryArchive> r300_archive(id<MTLDevice> dev)
+{
+    if (g_r300_archive_tried) {
+        return g_r300_archive;
+    }
+    g_r300_archive_tried = true;
+
+    const char *home = getenv("HOME");
+    if (!home) {
+        return nil;
+    }
+    NSString *dir = [NSString stringWithFormat:@"%s/Library/Caches/QemuMac-radeon9700",
+                              home];
+    NSError *err = nil;
+    if (![[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                    withIntermediateDirectories:YES
+                                                     attributes:nil
+                                                          error:&err]) {
+        qemu_log("ppc-mac-gpu r300: shader cache dir failed: %s\n",
+                 err.localizedDescription.UTF8String);
+        return nil;
+    }
+    g_r300_archive_url = [[NSURL fileURLWithPath:
+        [dir stringByAppendingPathComponent:@"r300-pipelines.bin"]] retain];
+
+    MTLBinaryArchiveDescriptor *ad = [[MTLBinaryArchiveDescriptor alloc] init];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:g_r300_archive_url.path]) {
+        ad.url = g_r300_archive_url;
+    }
+    g_r300_archive = [[dev newBinaryArchiveWithDescriptor:ad error:&err] retain];
+    [ad release];
+    if (!g_r300_archive) {
+        qemu_log("ppc-mac-gpu r300: shader cache open failed: %s\n",
+                 err.localizedDescription.UTF8String);
+    }
+    return g_r300_archive;
+}
 /* Sampler states by r300_sampler's key, open addressing: looked up for
  * every unit of every draw, so no boxing into NSNumbers. */
 #define R300_NSAMPLERS 1024
@@ -6966,9 +7023,29 @@ static id<MTLRenderPipelineState> r300_pipeline(id<MTLDevice> dev,
         }
     }
 
+    /*
+     * qemu#10: a cache miss here is a real Metal shader compile plus a
+     * pipeline-state build, tens to hundreds of ms each on this host, and
+     * this whole draw path runs synchronously on the vCPU thread (this
+     * file's header comment) -- called with the BQL held, same as the
+     * MMIO read qemu#5 fixed. A guest exercising many distinct fragment
+     * programs at once (alephone's shader renderer: one per sprite/blend
+     * combination) can need dozens of these in a single frame, and
+     * holding the BQL through all of them freezes every vCPU, timer and
+     * IO in the guest for the whole burst -- measured at ~19s for one
+     * frame, world ticks included. Nothing from here to the cache insert
+     * touches guest state (registers, VRAM) or anything a guest reset
+     * would invalidate -- msl/msl_id/cfmt/ncb/zfmt are already-copied
+     * arguments, and g_r300_pipes/g_r300_npipes are host-only globals --
+     * so it's safe to drop the BQL for the compile itself and let the
+     * rest of the guest keep running.
+     */
+    bql_unlock();
+    id<MTLBinaryArchive> archive = r300_archive(dev);
     NSString *src = [NSString stringWithUTF8String:msl];
     id<MTLLibrary> lib = [dev newLibraryWithSource:src options:nil error:&err];
     if (!lib) {
+        bql_lock();
         qemu_log("ppc-mac-gpu r300: shader compile failed: %s\n%s\n",
                  err.localizedDescription.UTF8String, msl);
         return nil;
@@ -6981,10 +7058,30 @@ static id<MTLRenderPipelineState> r300_pipeline(id<MTLDevice> dev,
         pd.colorAttachments[k].pixelFormat = cfmt[k];
     }
     pd.colorAttachments[ncb].pixelFormat = zfmt;
+    if (archive) {
+        pd.binaryArchives = @[archive];
+    }
     id<MTLRenderPipelineState> p =
         [dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (archive) {
+        /*
+         * Miss or hit, make sure this descriptor's functions are in the
+         * archive and flush to disk, so a *later* process (this run's
+         * guest reboot, or the next one) can load it back precompiled.
+         * Best-effort: an add/serialize failure just means no persistence
+         * for this shader, not a draw failure -- p is already valid.
+         */
+        NSError *aerr = nil;
+        if ([archive addRenderPipelineFunctionsWithDescriptor:pd error:&aerr]) {
+            if (![archive serializeToURL:g_r300_archive_url error:&aerr]) {
+                qemu_log("ppc-mac-gpu r300: shader cache save failed: %s\n",
+                         aerr.localizedDescription.UTF8String);
+            }
+        }
+    }
     [pd release];
     [lib release];
+    bql_lock();
     if (!p) {
         qemu_log("ppc-mac-gpu r300: pipeline failed: %s\n",
                  err.localizedDescription.UTF8String);
