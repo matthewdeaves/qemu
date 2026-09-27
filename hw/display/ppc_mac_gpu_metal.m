@@ -6550,23 +6550,72 @@ static void r200_note_written(uint64_t lo, uint64_t hi, const R200TexKey *key)
 }
 
 /*
- * Card addresses read (as textures) by draws in the open or in-flight
- * batches, as a bitmap of 4 KB pages over the 32-bit address space.  It
- * was a list of 64 ranges that, once full, made every draw look like a
- * hazard: Quake binds more textures than that a frame, and each of its
- * draws then waited for the GPU (18% of the vCPU).  Only the words set
- * since the last flush are cleared.
+ * Card addresses read (as textures) by draws, as bitmaps of 4 KB pages over
+ * the 32-bit address space.  It was a list of 64 ranges that, once full,
+ * made every draw look like a hazard: Quake binds more textures than that
+ * a frame, and each of its draws then waited for the GPU (18% of the
+ * vCPU).  Clearing touches only the words set since the last clear.
+ *
+ * Two of them: g_r200_reads_batch covers the open batch, the one a draw's
+ * render target must not overwrite without a split (r300_read_conflict);
+ * g_r200_reads_inflight covers everything not yet known complete, which a
+ * CPU write must wait for (metal_range_busy_r200).  A split clears the
+ * first, since the next batch starts only after this one completes on the
+ * GPU; only a flush, which waits for completion, clears the second.
  */
 #define R200_READ_SHIFT 12
 #define R200_READ_WORDS ((1ull << (32 - R200_READ_SHIFT)) / 64)
-static uint64_t g_r200_readmap[R200_READ_WORDS];
-static uint32_t g_r200_read_w0 = R200_READ_WORDS, g_r200_read_w1;  /* words set */
+typedef struct R200ReadMap {
+    uint64_t bits[R200_READ_WORDS];
+    uint32_t w0, w1;                    /* words set: [w0, w1) */
+} R200ReadMap;
+static R200ReadMap g_r200_reads_batch = { .w0 = R200_READ_WORDS };
+static R200ReadMap g_r200_reads_inflight = { .w0 = R200_READ_WORDS };
 
 static void r200_read_pages(uint64_t lo, uint64_t hi, uint64_t *p0, uint64_t *p1)
 {
     hi = MIN(hi, 1ull << 32);
     *p0 = lo >> R200_READ_SHIFT;
     *p1 = (hi - 1) >> R200_READ_SHIFT;
+}
+
+static void r200_readmap_set(R200ReadMap *m, uint64_t p0, uint64_t p1)
+{
+    for (uint64_t p = p0; p <= p1; p++) {
+        m->bits[p / 64] |= 1ull << (p % 64);
+    }
+    m->w0 = MIN(m->w0, (uint32_t)(p0 / 64));
+    m->w1 = MAX(m->w1, (uint32_t)(p1 / 64 + 1));
+}
+
+/* Whether any page of [lo, hi) is marked in m. */
+static bool r200_readmap_test(const R200ReadMap *m, uint64_t lo, uint64_t hi)
+{
+    uint64_t p0, p1;
+
+    if (hi <= lo || lo >= 1ull << 32 || m->w0 >= m->w1) {
+        return false;
+    }
+    r200_read_pages(lo, hi, &p0, &p1);
+    p0 = MAX(p0, (uint64_t)m->w0 * 64);
+    p1 = MIN(p1, (uint64_t)m->w1 * 64 - 1);
+    for (uint64_t p = p0; p <= p1; ) {
+        uint64_t w = m->bits[p / 64] >> (p % 64);
+        if (w && (p1 - p >= 63 || (w & ((2ull << (p1 - p)) - 1)))) {
+            return true;
+        }
+        p += 64 - p % 64;
+    }
+    return false;
+}
+
+static void r200_readmap_clear(R200ReadMap *m)
+{
+    if (m->w0 < m->w1) {
+        memset(m->bits + m->w0, 0, (m->w1 - m->w0) * sizeof(uint64_t));
+    }
+    m->w0 = R200_READ_WORDS;
+    m->w1 = 0;
 }
 
 static void r200_note_read(uint64_t lo, uint64_t hi)
@@ -6577,42 +6626,8 @@ static void r200_note_read(uint64_t lo, uint64_t hi)
         return;
     }
     r200_read_pages(lo, hi, &p0, &p1);
-    for (uint64_t p = p0; p <= p1; p++) {
-        g_r200_readmap[p / 64] |= 1ull << (p % 64);
-    }
-    g_r200_read_w0 = MIN(g_r200_read_w0, (uint32_t)(p0 / 64));
-    g_r200_read_w1 = MAX(g_r200_read_w1, (uint32_t)(p1 / 64 + 1));
-}
-
-/* Whether any page of [lo, hi) is read by the open or in-flight batches. */
-static bool r200_range_read(uint64_t lo, uint64_t hi)
-{
-    uint64_t p0, p1;
-
-    if (hi <= lo || lo >= 1ull << 32 || g_r200_read_w0 >= g_r200_read_w1) {
-        return false;
-    }
-    r200_read_pages(lo, hi, &p0, &p1);
-    p0 = MAX(p0, (uint64_t)g_r200_read_w0 * 64);
-    p1 = MIN(p1, (uint64_t)g_r200_read_w1 * 64 - 1);
-    for (uint64_t p = p0; p <= p1; ) {
-        uint64_t w = g_r200_readmap[p / 64] >> (p % 64);
-        if (w && (p1 - p >= 63 || (w & ((2ull << (p1 - p)) - 1)))) {
-            return true;
-        }
-        p += 64 - p % 64;
-    }
-    return false;
-}
-
-static void r200_reads_clear(void)
-{
-    if (g_r200_read_w0 < g_r200_read_w1) {
-        memset(g_r200_readmap + g_r200_read_w0, 0,
-               (g_r200_read_w1 - g_r200_read_w0) * sizeof(uint64_t));
-    }
-    g_r200_read_w0 = R200_READ_WORDS;
-    g_r200_read_w1 = 0;
+    r200_readmap_set(&g_r200_reads_batch, p0, p1);
+    r200_readmap_set(&g_r200_reads_inflight, p0, p1);
 }
 
 static bool metal_range_busy_r200(void *opaque, uint64_t lo, uint64_t hi,
@@ -6626,7 +6641,8 @@ static bool metal_range_busy_r200(void *opaque, uint64_t lo, uint64_t hi,
             return true;
         }
     }
-    return write_access && r200_range_read(lo, hi);
+    return write_access &&
+           r200_readmap_test(&g_r200_reads_inflight, lo, hi);
 }
 
 static bool r200_batch_conflict(uint64_t lo, uint64_t hi, const R200TexKey *same)
@@ -6738,10 +6754,32 @@ static bool metal_flush_r200(void *opaque)
     [g_r200_inflight release];
     g_r200_inflight = nil;
     g_r200_nwritten = 0;
-    r200_reads_clear();
+    r200_readmap_clear(&g_r200_reads_batch);
+    r200_readmap_clear(&g_r200_reads_inflight);
     g_r200_stat_flushes++;
     g_r200_stat_flush_us += g_get_monotonic_time() - t0;
     return true;
+}
+
+/*
+ * End the batch for a hazard without stopping the vCPU: the next batch
+ * starts on the GPU only after this one completes (r200_new_cb), so its
+ * draws may overwrite what this one sampled or read what it rendered.
+ * PPCGPU_SPLIT=0 waits instead.
+ */
+static void r200_split(PPCMacGPUMetalState *st)
+{
+    if (!r200_split_enabled()) {
+        metal_flush_r200(st);
+        return;
+    }
+    if (!g_r200_event) {
+        g_r200_event = [st->device newSharedEvent];
+    }
+    r200_commit(NULL, NULL);
+    g_r200_epoch++;
+    r200_readmap_clear(&g_r200_reads_batch);
+    g_r200_stat_splits++;
 }
 
 /* A 2D fill that lands on a guest depth buffer clears our private copy. */
@@ -7160,16 +7198,7 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             metal_flush_r200(st);                  /* forget everything written */
         } else if (conflict) {
             g_r200_stat_conflicts++;
-            if (r200_split_enabled()) {
-                if (!g_r200_event) {
-                    g_r200_event = [st->device newSharedEvent];
-                }
-                r200_commit(NULL, NULL);           /* the GPU keeps the order */
-                g_r200_epoch++;
-                g_r200_stat_splits++;
-            } else {
-                metal_flush_r200(st);
-            }
+            r200_split(st);                        /* the GPU keeps the order */
         }
         if (!g_r200_cb) {
             g_r200_cb = r200_new_cb(st);
@@ -7560,7 +7589,7 @@ static id<MTLSamplerState> r300_sampler(id<MTLDevice> dev, uint32_t f0,
 static bool r300_read_conflict(uint64_t lo, uint64_t hi, const R200TexKey *rt)
 {
     (void)rt;       /* the same target conflicts too if it is sampled */
-    return r200_range_read(lo, hi);
+    return r200_readmap_test(&g_r200_reads_batch, lo, hi);
 }
 
 /* Metal format of a colour-buffer view (R300_RTV_*). */
@@ -8027,10 +8056,13 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             tex[t] = x;
         }
 
-        /* Batch hazards, as in the R200 path. */
-        bool conflict = g_r200_nwritten >= R200_MAX_WRITTEN - 1 - (int)ncb ||
-                        (want_ds && (r200_batch_conflict(dlo, dhi, &dk) ||
-                                     r300_read_conflict(dlo, dhi, &dk)));
+        /* Batch hazards, as in the R200 path: a full written list needs a
+         * flush to forget it; anything else only a split, which does not
+         * stop the vCPU (it was a flush: 26% of the vCPU in Quake, with
+         * the BQL held, which is what made the sound stutter). */
+        bool full = g_r200_nwritten >= R200_MAX_WRITTEN - 1 - (int)ncb;
+        bool conflict = want_ds && (r200_batch_conflict(dlo, dhi, &dk) ||
+                                    r300_read_conflict(dlo, dhi, &dk));
         for (uint32_t k = 0; k < ncb && !conflict; k++) {
             uint64_t lo = ck[k].offset, hi = lo + (uint64_t)ck[k].pitch * ck[k].height;
             conflict = r200_batch_conflict(lo, hi, &ck[k]) || r300_read_conflict(lo, hi, &ck[k]);
@@ -8041,9 +8073,11 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                     (uint64_t)pkt->tex[t].gpu_addr + pkt->tex[t].size_bytes, NULL);
             }
         }
-        if (conflict) {
-            g_r200_stat_conflicts++;
+        if (full) {
             metal_flush_r200(st);
+        } else if (conflict) {
+            g_r200_stat_conflicts++;
+            r200_split(st);
         }
         if (!g_r200_cb) {
             g_r200_cb = r200_new_cb(st);
