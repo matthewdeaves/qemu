@@ -2349,6 +2349,29 @@ static bool r300_write_raw(PPCMacGPUState *s, uint32_t gpu_addr,
     return false;
 }
 
+/*
+ * qemu#7: copy a whole rendered buffer out of scratch VRAM to a GART/AGP
+ * (system-memory) guest address -- the write-side counterpart of
+ * r300_read_raw's page walk, used to hand a GART-redirected render target
+ * back to the guest once the draw that filled it has actually landed.
+ */
+static bool r300_write_raw_bulk(PPCMacGPUState *s, uint32_t gpu_addr,
+                                const uint8_t *src, uint32_t len)
+{
+    while (len) {
+        uint8_t *page = r200_agp_page(s, gpu_addr);
+        uint32_t n = MIN(len, 0x1000 - (gpu_addr & 0xFFF));
+        if (!page) {
+            return false;
+        }
+        memcpy(page + (gpu_addr & 0xFFF), src, n);
+        src += n;
+        gpu_addr += n;
+        len -= n;
+    }
+    return true;
+}
+
 /* The card's endian swap modes (VC_SWAP, DEPTHENDIAN, ...). */
 static uint32_t r300_swap_mode(uint32_t v, unsigned mode)
 {
@@ -3084,33 +3107,52 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
     if (pkt.warn & R300_WARN_FLOW)     r300_warn_once("vertex program flow control ran away", NULL);
 
     uint32_t ns = pkt.aa_samples;
-    if (!r300_to_vram(s, &pkt.rt_gpu_addr,
-                      (uint64_t)pkt.rt_pitch * pkt.rt_bpp * pkt.rt_height * ns)) {
+    uint64_t rt_full_len = (uint64_t)pkt.rt_pitch * pkt.rt_bpp * pkt.rt_height * ns;
+    uint32_t rt_gart_addr = pkt.rt_gpu_addr;   /* pre-translation, for the copy-out */
+    bool rt_via_gart = false;
+    if (!r300_to_vram(s, &pkt.rt_gpu_addr, rt_full_len)) {
         /*
-         * qemu#7: this draw is dropped outright, and at least one repro
-         * (a guest screenshotJPEG/glReadPixels capture) turned out to
-         * target a perfectly valid GART-mapped address rather than a
-         * garbage one -- r300_to_vram() only ever checks the local VRAM
-         * window, so a real render-to-system-memory target reads as
-         * "outside VRAM" and is silently lost. Bring-up diagnostic to
-         * save re-deriving this by hand next time.
+         * qemu#7: at least one repro (a guest screenshotJPEG/glReadPixels
+         * capture) turned out to target a perfectly valid GART-mapped
+         * address rather than a garbage one -- r300_to_vram() only ever
+         * checks the local VRAM window, so a real render-to-system-memory
+         * target reads as "outside VRAM". Real hardware plausibly renders
+         * straight into such a target via DMA; the closest we can do is
+         * render it into a reserved scratch region of the same Metal
+         * buffer (see R300_GART_RT_SCRATCH_SIZE) and copy the result out
+         * to the real guest address once the draw has actually landed
+         * (below, alongside the rest of this draw's post-draw bookkeeping).
+         * Not attempted for an AA-resolve source (untested, unobserved
+         * combination; r300_aa_resolve has its own, separate, unmodified
+         * to_vram check on the resolve *destination*) or a target bigger
+         * than the scratch region -- those still drop, exactly as before.
          */
-        if (gpu_diag_on()) {
-            hwaddr phys = 0;
-            bool via_agp = ppc_mac_gpu_agp_translate(s, pkt.rt_gpu_addr, &phys);
-            bool via_gart = !via_agp &&
-                ppc_mac_gpu_gart_translate(s, pkt.rt_gpu_addr, &phys);
-            qemu_log("[R300_RTBOUNDS] addr=0x%x fb_base=0x%x pitch=%u bpp=%u "
-                     "height=%u samples=%u vram_size=%llu agp=%d gart=%d "
-                     "phys=0x%llx\n",
-                     pkt.rt_gpu_addr, (s->regs.mc_fb_location & 0xFFFF) << 16,
-                     pkt.rt_pitch, pkt.rt_bpp, pkt.rt_height, ns,
-                     (unsigned long long)s->vram_size, via_agp, via_gart,
-                     (unsigned long long)phys);
+        hwaddr phys = 0;
+        bool via_agp = ppc_mac_gpu_agp_translate(s, rt_gart_addr, &phys);
+        bool via_gart = !via_agp &&
+            ppc_mac_gpu_gart_translate(s, rt_gart_addr, &phys);
+        bool is_resolve = (r300_reg(s->r3, 0x4E88) & 1) != 0;  /* AARESOLVE_CTL */
+        if ((via_agp || via_gart) && !is_resolve &&
+            rt_full_len && rt_full_len <= R300_GART_RT_SCRATCH_SIZE) {
+            pkt.rt_gpu_addr = (uint32_t)s->vram_size;
+            rt_via_gart = true;
+            r300_warn_once("colour buffer in GART/AGP memory: rendered via "
+                           "a scratch copy-out", NULL);
+        } else {
+            if (gpu_diag_on()) {
+                qemu_log("[R300_RTBOUNDS] addr=0x%x fb_base=0x%x pitch=%u bpp=%u "
+                         "height=%u samples=%u vram_size=%llu agp=%d gart=%d "
+                         "phys=0x%llx resolve=%d len=%llu\n",
+                         rt_gart_addr, (s->regs.mc_fb_location & 0xFFFF) << 16,
+                         pkt.rt_pitch, pkt.rt_bpp, pkt.rt_height, ns,
+                         (unsigned long long)s->vram_size, via_agp, via_gart,
+                         (unsigned long long)phys, is_resolve,
+                         (unsigned long long)rt_full_len);
+            }
+            r300_warn_once("colour buffer outside VRAM", NULL);
+            r300_draw_free(&pkt);
+            return;
         }
-        r300_warn_once("colour buffer outside VRAM", NULL);
-        r300_draw_free(&pkt);
-        return;
     }
     /* Render targets B-D (multiple render targets / multiwrites) */
     for (uint32_t k = 1; k < pkt.num_cb; k++) {
@@ -3210,7 +3252,8 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         if (sync_each < 0) {
             sync_each = getenv("R300_SYNC") != NULL;   /* debug: no batching */
         }
-        int rr = s->renderer->draw_r300(s->renderer_opaque, vram, s->vram_size, &pkt);
+        int rr = s->renderer->draw_r300(s->renderer_opaque, vram,
+                                        s->vram_alloc_size, &pkt);
         if (s->r3_dump && g_r300_arm_rt && pkt.rt_gpu_addr == g_r300_arm_rt) {
             fprintf(s->r3_dump, "   renderer -> %d\n", rr);
         }
@@ -3305,25 +3348,45 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                             (unsigned long long)s->r3->draws);
                 }
             }
-            /* As the R200 path does: the display and the dirty-tracking
-             * scanout only refresh what they are told changed. */
-            uint64_t len = (uint64_t)pkt.rt_pitch * pkt.rt_bpp * pkt.rt_height;
-            memory_region_set_dirty(&s->vram, pkt.rt_gpu_addr, len);
-            for (uint32_t k = 1; k < pkt.num_cb; k++) {
-                memory_region_set_dirty(&s->vram, pkt.cb[k].gpu_addr,
-                                        (uint64_t)pkt.cb[k].pitch * pkt.cb[k].bpp *
-                                        pkt.rt_height);
-            }
-            r200_rate.draws++;
-            r200_perf.draws++;
-            r200_perf.drew = true;
-            r200_perf_high(pkt.rt_gpu_addr + len);
-            /* The compositor presents by drawing the visible frame buffer
-             * at the card's 3D pitch (a multiple of 32 pixels): scan out
-             * at that pitch, as the R200 path does for its present BLT. */
-            if (pkt.rt_gpu_addr == s->disp.offset &&
-                pkt.rt_pitch * pkt.rt_bpp != s->disp.stride) {
-                r200_set_present_pitch(s, pkt.rt_pitch * pkt.rt_bpp);
+            if (rt_via_gart) {
+                /*
+                 * qemu#7: hand the rendered scratch buffer back to the
+                 * guest's real GART/AGP address now that the draw has
+                 * landed. flush_r200 first: draw_r300 above may just have
+                 * enqueued Metal work rather than run it synchronously
+                 * (see R300_SYNC), and this buffer isn't display-scanned-out
+                 * VRAM that some later, ordinary flush would catch for us.
+                 */
+                if (s->renderer->flush_r200) {
+                    s->renderer->flush_r200(s->renderer_opaque);
+                }
+                if (!r300_write_raw_bulk(s, rt_gart_addr,
+                                         vram + pkt.rt_gpu_addr, rt_full_len)) {
+                    r300_warn_once("GART/AGP colour buffer copy-out failed "
+                                   "(guest unmapped it mid-draw?)", NULL);
+                }
+            } else {
+                /* As the R200 path does: the display and the dirty-tracking
+                 * scanout only refresh what they are told changed. */
+                uint64_t len = (uint64_t)pkt.rt_pitch * pkt.rt_bpp * pkt.rt_height;
+                memory_region_set_dirty(&s->vram, pkt.rt_gpu_addr, len);
+                for (uint32_t k = 1; k < pkt.num_cb; k++) {
+                    memory_region_set_dirty(&s->vram, pkt.cb[k].gpu_addr,
+                                            (uint64_t)pkt.cb[k].pitch * pkt.cb[k].bpp *
+                                            pkt.rt_height);
+                }
+                r200_rate.draws++;
+                r200_perf.draws++;
+                r200_perf.drew = true;
+                r200_perf_high(pkt.rt_gpu_addr + len);
+                /* The compositor presents by drawing the visible frame
+                 * buffer at the card's 3D pitch (a multiple of 32 pixels):
+                 * scan out at that pitch, as the R200 path does for its
+                 * present BLT. */
+                if (pkt.rt_gpu_addr == s->disp.offset &&
+                    pkt.rt_pitch * pkt.rt_bpp != s->disp.stride) {
+                    r200_set_present_pitch(s, pkt.rt_pitch * pkt.rt_bpp);
+                }
             }
         }
         if (need_bql) {
@@ -11703,10 +11766,18 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
      * This lets both the guest CPU (WindowServer memcpy) and the Metal GPU
      * (QE compositor draws) access the same physical memory — exactly like
      * real VRAM on an R200.  Falls back to normal QEMU RAM on other hosts.
+     *
+     * On the r300 path, the Metal buffer is over-allocated by
+     * R300_GART_RT_SCRATCH_SIZE (qemu#7): s->vram itself still only covers
+     * s->vram_size and is never resized, so the guest can't see or reach
+     * the extra bytes through any BAR -- only draw_r300 is ever told the
+     * larger vram_alloc_size, so a GART-redirected render target's offset
+     * (== vram_size) passes that call's own bounds check.
      */
+    s->vram_alloc_size = s->vram_size + (s->r300 ? R300_GART_RT_SCRATCH_SIZE : 0);
 #ifdef CONFIG_DARWIN
     s->metal_vram_ptr = ppc_mac_gpu_metal_alloc_vram(
-        s->vram_size, &s->metal_vram_opaque);
+        s->vram_alloc_size, &s->metal_vram_opaque);
 #endif
     if (s->metal_vram_ptr) {
         /* Zero-copy path: QEMU uses the MTLBuffer's memory directly */

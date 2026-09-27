@@ -46,6 +46,16 @@ struct R200Vertex;
 #define PPC_MAC_GPU_IO_SIZE            0x100    /* 256 bytes I/O */
 #define PPC_MAC_GPU_MMIO_SIZE          0x10000  /* 64 KB MMIO */
 
+/* qemu#7: internal scratch past the guest-visible end of the r300 zero-copy
+ * Metal buffer, used to render a colour render target the guest placed in
+ * GART/AGP (system) memory instead of local VRAM -- r300_to_vram() has no
+ * notion of anything but the local VRAM window, so such a target used to be
+ * silently dropped. 16 MB covers any render target up to 2048x2048x4Bpp
+ * single-sample, comfortably past any real display resolution Tiger runs at
+ * on this class of Mac. Never mapped into any BAR/MemoryRegion the guest can
+ * reach -- see PPCMacGPUState.vram_alloc_size. */
+#define R300_GART_RT_SCRATCH_SIZE      (16 * 1024 * 1024)
+
 /* ========================================================================
  * Register Offsets - R200/RV280 family
  *
@@ -689,6 +699,14 @@ struct PPCMacGPUState {
     uint32_t r300_aic_pt_base;  /* PCI GART table base (0x0AB0) */
     uint32_t vram_size_mb;      /* VRAM size in megabytes */
     uint64_t vram_size;         /* VRAM size in bytes (computed) */
+    /* Physical size of the host allocation backing s->vram: vram_size plus
+     * R300_GART_RT_SCRATCH_SIZE of internal scratch past the guest-visible
+     * end, on the r300 zero-copy Metal path (qemu#7). Never exposed to the
+     * guest through any BAR/MemoryRegion -- only used as the vram_size
+     * bound passed to the renderer's draw_r300, so a GART-redirected
+     * render target's linear-view offset (== vram_size) passes its bounds
+     * check. Equals vram_size everywhere else. */
+    uint64_t vram_alloc_size;
     /* Per 4 KB page of VRAM, the generation of the last write seen through
      * the dirty log (r300_vram_write_gen); vram_gen is the newest. */
     uint32_t *vram_page_gen;
