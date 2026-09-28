@@ -5912,6 +5912,11 @@ static uint64_t g_r200_stat_draws, g_r200_stat_passes, g_r200_stat_flushes,
  * g_r200_stat_conflicts, which is the render-target/depth batch conflict. */
 static uint64_t g_r300_stat_tex_hazard_full, g_r300_stat_tex_hazard_raw;
 
+/* qemu#17: how often r300_texture_full falls through to allocating a new
+ * MTLTexture and re-uploading every level, and the total bytes that costs --
+ * see the counter's own call site for why this differs from a cache hit. */
+static uint64_t g_r300_stat_tex_full_upload, g_r300_stat_tex_full_upload_bytes;
+
 /* VRAM ranges written by render passes in the open batch.  Views that alias
  * the same memory are distinct Metal objects, so Metal does not order a
  * write through one against a read through another: a draw that would read
@@ -7488,6 +7493,14 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
         hash = r300_hash(src, td->size_bytes);
     }
 
+    /* qemu#17: a fresh MTLTexture and a full multi-level replaceRegion
+     * upload, whether this is a genuine cache miss or just one dirty page
+     * out of many (the per-page recheck above only narrows re-HASHING,
+     * never re-uploading) -- ticket step 2's suspected "whole-texture
+     * re-upload instead of the sub-rect". */
+    g_r300_stat_tex_full_upload++;
+    g_r300_stat_tex_full_upload_bytes += td->size_bytes;
+
     MTLTextureDescriptor *d = [[MTLTextureDescriptor alloc] init];
     d.textureType = td->dim == R300_TEXDIM_3D ? MTLTextureType3D :
                     td->dim == R300_TEXDIM_CUBE ? MTLTextureTypeCube : MTLTextureType2D;
@@ -7983,7 +7996,8 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     if (g_r200_stat_draws % 2000 == 0) {
         qemu_log("ppc-mac-gpu r300: %llu draws, %llu passes, %llu flushes "
                  "(%llu batch-conflict, %llu tex-hazard-full, "
-                 "%llu tex-hazard-raw), avg flush %llu us, views %llu hit/%llu new\n",
+                 "%llu tex-hazard-raw), avg flush %llu us, views %llu hit/%llu new, "
+                 "tex full-upload %llu (%llu KB)\n",
                  (unsigned long long)g_r200_stat_draws,
                  (unsigned long long)g_r200_stat_passes,
                  (unsigned long long)g_r200_stat_flushes,
@@ -7993,7 +8007,9 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                  (unsigned long long)(g_r200_stat_flushes ?
                      g_r200_stat_flush_us / g_r200_stat_flushes : 0),
                  (unsigned long long)g_r200_stat_view_hit,
-                 (unsigned long long)g_r200_stat_view_new);
+                 (unsigned long long)g_r200_stat_view_new,
+                 (unsigned long long)g_r300_stat_tex_full_upload,
+                 (unsigned long long)(g_r300_stat_tex_full_upload_bytes / 1024));
     }
     return 0;
 }
