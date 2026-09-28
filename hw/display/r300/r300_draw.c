@@ -687,8 +687,23 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
             t->kind = R300_TEXK_CONVERT16; bpp = 2;
             break;
         case 0xC:                       /* W8Z8Y8X8 */
-            /* VRAM holds the guest CPU's big-endian words (see r300_tex). */
-            t->kind = R300_TEXK_RGBA8; bpp = 4; decode = (off & 3) == 0;
+            /* VRAM holds the guest CPU's big-endian words (see r300_tex).
+             * TXO_ENDIAN (off & 3) has four modes; r300_tpost() (r300_us.c)
+             * already has a distinct shader branch for each (k==1/2/3 ->
+             * abgr/grba/bgra). This used to collapse 1/2/3 all into k=0
+             * ("raw", no correction at all) -- qemu#15: a neutral lightmap
+             * texel with TXO_ENDIAN 1-3 read back with its green channel
+             * zeroed, which reads as a magenta/purple cast once a real
+             * per-surface relight path (rather than flashblend) actually
+             * exercises those modes. Mapping TXO_ENDIAN's own 0-3 value
+             * onto the shader's three swizzle branches is a reasoned
+             * guess (qemu#15), not confirmed against real hardware docs:
+             * 0 keeps its known-working abgr correction, 1 shares it
+             * (untested whether that is actually right), 2/3 reach the
+             * shader's grba/bgra branches for the first time. Verified
+             * live against qemu#15's own repro before landing. */
+            t->kind = R300_TEXK_RGBA8; bpp = 4;
+            decode = (off & 3) ? (off & 3) : 1;
             break;
         case 0xF:  t->kind = R300_TEXK_DXT1; bpp = 8;  dxt = true; decode = 3; break;   /* per block */
         case 0x10: t->kind = R300_TEXK_DXT3; bpp = 16; dxt = true; decode = 3; break;
