@@ -5948,6 +5948,14 @@ static id<MTLSharedEvent> g_r200_event;
 static uint64_t g_r200_event_val;
 static uint64_t g_r200_stat_splits;
 
+/* qemu#17: r200_new_cb showed 32.5% of metal_draw_r300's inclusive profile
+ * cost despite being two trivial calls -- times whether that cost is really
+ * -[MTLCommandQueue commandBuffer] itself (e.g. blocking on the queue's
+ * in-flight-command-buffer cap under ~40k splits/run) rather than something
+ * elsewhere in the inclusive call tree the profiler folded in here. */
+static uint64_t g_r200_stat_new_cb_calls;
+static int64_t g_r200_stat_new_cb_us;
+
 static bool r200_split_enabled(void)
 {
     static int on = -1;
@@ -5961,7 +5969,10 @@ static bool r200_split_enabled(void)
 /* A new command buffer, ordered after everything committed before it. */
 static id<MTLCommandBuffer> r200_new_cb(PPCMacGPUMetalState *st)
 {
+    int64_t t0 = g_get_monotonic_time();
     id<MTLCommandBuffer> cb = [[st->commandQueue commandBuffer] retain];
+    g_r200_stat_new_cb_us += g_get_monotonic_time() - t0;
+    g_r200_stat_new_cb_calls++;
     if (g_r200_event && g_r200_event_val) {
         [cb encodeWaitForEvent:g_r200_event value:g_r200_event_val];
     }
@@ -8023,7 +8034,8 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                  "(%llu batch-conflict [%llu depth/%llu colour/%llu tex], "
                  "%llu tex-hazard-full, "
                  "%llu tex-hazard-raw), avg flush %llu us, views %llu hit/%llu new, "
-                 "tex full-upload %llu (%llu KB)\n",
+                 "tex full-upload %llu (%llu KB), "
+                 "new_cb %llu calls avg %llu us (total %llu us)\n",
                  (unsigned long long)g_r200_stat_draws,
                  (unsigned long long)g_r200_stat_passes,
                  (unsigned long long)g_r200_stat_flushes,
@@ -8038,7 +8050,11 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                  (unsigned long long)g_r200_stat_view_hit,
                  (unsigned long long)g_r200_stat_view_new,
                  (unsigned long long)g_r300_stat_tex_full_upload,
-                 (unsigned long long)(g_r300_stat_tex_full_upload_bytes / 1024));
+                 (unsigned long long)(g_r300_stat_tex_full_upload_bytes / 1024),
+                 (unsigned long long)g_r200_stat_new_cb_calls,
+                 (unsigned long long)(g_r200_stat_new_cb_calls ?
+                     g_r200_stat_new_cb_us / g_r200_stat_new_cb_calls : 0),
+                 (unsigned long long)g_r200_stat_new_cb_us);
     }
     return 0;
 }
