@@ -12,6 +12,7 @@ cd "$(dirname "$0")"
 export MallocPreScribble=1
 B=${1:-${TMPDIR:-/tmp}/r300-tests}
 mkdir -p "$B"
+python3 test_cp_reads.py
 R=../../hw/display/r300
 SRC="$R/r300_state.c $R/r300_pvs.c $R/r300_us.c $R/r300_draw.c"
 for t in test_pvs test_us test_draw test_features test_upload test_clear test_lightlog; do

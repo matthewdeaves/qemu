@@ -3578,6 +3578,24 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s);
 static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
                                     uint64_t val, unsigned int size);
 
+/* qemu#1: capture the reads that actually failed, without rereading guest
+ * memory (which could change, or be MMIO). Only CP reads request a trace. */
+typedef struct PPCMacGPUXlatTrace {
+    const char *reason;
+    hwaddr table, pte_addr;
+    uint32_t page_idx, pte;
+    MemTxResult tx;
+} PPCMacGPUXlatTrace;
+
+typedef struct PPCMacGPUCPReadTrace {
+    PPCMacGPUXlatTrace aic, agp;
+    uint32_t base, size_dw, addr, run;
+    hwaddr phys;
+    MemTxResult tx;
+    const char *path;
+    bool data_read;
+} PPCMacGPUCPReadTrace;
+
 /*
  * GART (AGP Intelligent Controller) address translation.
  *
@@ -3593,12 +3611,19 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
  *
  * Returns true if translation succeeded, with *phys_addr set.
  */
-static bool ppc_mac_gpu_gart_translate(PPCMacGPUState *s,
+static bool ppc_mac_gpu_gart_translate_trace(PPCMacGPUState *s,
                                         uint32_t gpu_addr,
-                                        hwaddr *phys_addr)
+                                        hwaddr *phys_addr,
+                                        PPCMacGPUXlatTrace *trace)
 {
+    if (trace) {
+        *trace = (PPCMacGPUXlatTrace) { .reason = "disabled" };
+    }
     if (!(s->regs.aic_ctrl & 1)) {
         return false;  /* GART disabled */
+    }
+    if (trace) {
+        trace->reason = "range";
     }
     if (gpu_addr < s->regs.aic_lo_addr || gpu_addr > s->regs.aic_hi_addr) {
         return false;  /* Outside GART aperture */
@@ -3623,6 +3648,14 @@ static bool ppc_mac_gpu_gart_translate(PPCMacGPUState *s,
     MemTxResult r = address_space_read(
         &address_space_memory, pte_addr,
         MEMTXATTRS_UNSPECIFIED, &pte_raw, 4);
+    if (trace) {
+        trace->table = pt_base;
+        trace->page_idx = page_idx;
+        trace->pte_addr = pte_addr;
+        trace->pte = le32_to_cpu(pte_raw);
+        trace->tx = r;
+        trace->reason = r == MEMTX_OK ? "zero-page" : "pte-read";
+    }
     if (r != MEMTX_OK) {
         return false;
     }
@@ -3649,6 +3682,9 @@ static bool ppc_mac_gpu_gart_translate(PPCMacGPUState *s,
         gart_log_count++;
     }
 
+    if (trace) {
+        trace->reason = "ok";
+    }
     *phys_addr = phys_page | page_off;
     return true;
 }
@@ -3672,13 +3708,17 @@ static bool ppc_mac_gpu_gart_translate(PPCMacGPUState *s,
  * uni-north bridge reads PTEs in little-endian (GPU-native) format,
  * matching how the AIC GART PTEs are stored.
  */
-static bool ppc_mac_gpu_agp_translate(PPCMacGPUState *s,
+static bool ppc_mac_gpu_agp_translate_trace(PPCMacGPUState *s,
                                        uint32_t gpu_addr,
-                                       hwaddr *phys_addr)
+                                       hwaddr *phys_addr,
+                                        PPCMacGPUXlatTrace *trace)
 {
     /* Check if address falls within MC_AGP_LOCATION range.
      *   bits [15:0] = AGP start >> 16
      *   bits [31:16] = AGP end >> 16 */
+    if (trace) {
+        *trace = (PPCMacGPUXlatTrace) { .reason = "disabled" };
+    }
     uint32_t agp_loc = s->regs.mc_agp_location;
     if (agp_loc == 0) {
         return false;
@@ -3686,6 +3726,9 @@ static bool ppc_mac_gpu_agp_translate(PPCMacGPUState *s,
     uint32_t agp_start = (agp_loc & 0xFFFF) << 16;
     uint32_t agp_end = (((agp_loc >> 16) & 0xFFFF) << 16) | 0xFFFF;
 
+    if (trace) {
+        trace->reason = "range";
+    }
     if (gpu_addr < agp_start || gpu_addr > agp_end) {
         return false;
     }
@@ -3693,6 +3736,9 @@ static bool ppc_mac_gpu_agp_translate(PPCMacGPUState *s,
     /* Use the uni-north AGP bridge's GART page table base.
      * This is programmed by the kext via PCI config space (offset 0x8C)
      * and is often different from the GPU's AIC_PT_BASE. */
+    if (trace) {
+        trace->reason = "no-table";
+    }
     hwaddr gart_table = uninorth_get_agp_gart_base();
     if (gart_table == 0) {
         /* Fall back to AIC_PT_BASE if bridge GART not yet programmed */
@@ -3712,6 +3758,14 @@ static bool ppc_mac_gpu_agp_translate(PPCMacGPUState *s,
     uint32_t pte_raw = 0;
     MemTxResult r = address_space_read(&address_space_memory, pte_addr,
                                         MEMTXATTRS_UNSPECIFIED, &pte_raw, 4);
+    if (trace) {
+        trace->table = gart_table;
+        trace->page_idx = page_idx;
+        trace->pte_addr = pte_addr;
+        trace->pte = le32_to_cpu(pte_raw);
+        trace->tx = r;
+        trace->reason = r == MEMTX_OK ? "zero-page" : "pte-read";
+    }
     if (r != MEMTX_OK) {
         return false;
     }
@@ -3740,8 +3794,24 @@ static bool ppc_mac_gpu_agp_translate(PPCMacGPUState *s,
         agp_log_count++;
     }
 
+    if (trace) {
+        trace->reason = "ok";
+    }
     *phys_addr = phys_page | page_off;
     return true;
+}
+
+/* Keep non-CP callers on the same translation path without collecting data. */
+static bool ppc_mac_gpu_gart_translate(PPCMacGPUState *s, uint32_t gpu_addr,
+                                       hwaddr *phys_addr)
+{
+    return ppc_mac_gpu_gart_translate_trace(s, gpu_addr, phys_addr, NULL);
+}
+
+static bool ppc_mac_gpu_agp_translate(PPCMacGPUState *s, uint32_t gpu_addr,
+                                      hwaddr *phys_addr)
+{
+    return ppc_mac_gpu_agp_translate_trace(s, gpu_addr, phys_addr, NULL);
 }
 
 /*
@@ -3757,8 +3827,10 @@ static bool ppc_mac_gpu_agp_translate(PPCMacGPUState *s,
  * flatview lookups were about 7% of the vCPU in Quake.
  */
 static bool ppc_mac_gpu_read_dwords(PPCMacGPUState *s, uint32_t gpu_addr,
-                                    uint32_t *dst, uint32_t n)
+                                    uint32_t *dst, uint32_t n,
+                                    PPCMacGPUCPReadTrace *trace)
 {
+    *trace = (PPCMacGPUCPReadTrace) { .base = gpu_addr, .size_dw = n };
     AddressSpace *as = pci_get_address_space(&s->pci);
 
     while (n) {
@@ -3768,13 +3840,27 @@ static bool ppc_mac_gpu_read_dwords(PPCMacGPUState *s, uint32_t gpu_addr,
         if (!run) {
             run = 1;                    /* a dword straddling a page */
         }
-        if (!ppc_mac_gpu_gart_translate(s, gpu_addr, &phys) &&
-            !ppc_mac_gpu_agp_translate(s, gpu_addr, &phys)) {
+        trace->addr = gpu_addr;
+        trace->run = run;
+        trace->agp = (PPCMacGPUXlatTrace) { .reason = "not-tried" };
+        trace->path = "none";
+        trace->phys = 0;
+        trace->tx = MEMTX_OK;
+        trace->data_read = false;
+        if (ppc_mac_gpu_gart_translate_trace(s, gpu_addr, &phys, &trace->aic)) {
+            trace->path = "aic";
+        } else if (ppc_mac_gpu_agp_translate_trace(s, gpu_addr, &phys,
+                                                   &trace->agp)) {
+            trace->path = "agp";
+        } else {
             gpu_debug_log("CP: GART translate failed at gpu_addr=0x%x", gpu_addr);
             return false;
         }
-        if (address_space_read(as, phys, MEMTXATTRS_UNSPECIFIED, dst,
-                               run * 4) != MEMTX_OK) {
+        trace->phys = phys;
+        trace->data_read = true;
+        trace->tx = address_space_read(as, phys, MEMTXATTRS_UNSPECIFIED, dst,
+                                       run * 4);
+        if (trace->tx != MEMTX_OK) {
             gpu_debug_log("CP: read failed at phys=0x%"PRIx64, (uint64_t)phys);
             return false;
         }
@@ -3790,12 +3876,13 @@ static bool ppc_mac_gpu_read_dwords(PPCMacGPUState *s, uint32_t gpu_addr,
 
 static uint32_t *ppc_mac_gpu_read_ib_via_gart(PPCMacGPUState *s,
                                                 uint32_t ib_base,
-                                                uint32_t ib_size_dw)
+                                                uint32_t ib_size_dw,
+                                                PPCMacGPUCPReadTrace *trace)
 {
     uint32_t *buf = g_malloc(ib_size_dw * 4);
 
     /* PM4 is in guest memory in the CPU's (big-endian) byte order. */
-    if (!ppc_mac_gpu_read_dwords(s, ib_base, buf, ib_size_dw)) {
+    if (!ppc_mac_gpu_read_dwords(s, ib_base, buf, ib_size_dw, trace)) {
         g_free(buf);
         return NULL;
     }
@@ -9114,55 +9201,151 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
     g_in_pm4--;
 }
 
-/*
- * qemu#1: "IB lost (not in GART or VRAM)" has been seen once flooding the
- * log after a long steady-state run (5.5M+ draws), guest frozen. Not
- * reproduced on demand yet, so when it recurs we want the state that made
- * both ppc_mac_gpu_gart_translate() and ppc_mac_gpu_agp_translate() give up
- * on THIS address, not just the address itself. Capped per process
- * lifetime so it adds detail without out-flooding the flood it diagnoses.
- */
-static void ppc_mac_gpu_dump_ib_lost_diag(PPCMacGPUState *s, uint32_t ib_base)
+/* Diagnostic history is bounded per process, like the original IB report.
+ * Entries carry an owner so another adapter's reads/writes aren't attributed
+ * to this one. CP submission and register writes are serialized by the BQL.
+ * No retries, extra guest reads, or changes to completion behavior. */
+static const char *cp_submission = "mmio";
+
+static struct {
+    PPCMacGPUState *owner;
+    uint64_t count;
+    PPCMacGPUCPReadTrace read;
+    uint32_t aic_ctrl, lo, hi, pt, r300_pt, agp, fb, bridge_gen, reset_gen;
+    hwaddr bridge;
+    uint16_t pci_command;
+} cp_last_good[2];              /* 0: IB, 1: ring, system-memory reads only */
+
+static struct {
+    PPCMacGPUState *owner;
+    const char *source;
+    uint32_t reg, old, val, reset_gen;
+    uint64_t draw;
+    bool bql;
+} cp_map_writes[16];
+static unsigned cp_map_next, cp_map_count;
+
+static void ppc_mac_gpu_cp_map_write(PPCMacGPUState *s, uint32_t reg,
+                                      uint32_t old, uint32_t val,
+                                      const char *source)
 {
-    static int budget = 5;
-    if (budget <= 0) {
+    if (old == val) {
         return;
     }
-    budget--;
+    unsigned i = cp_map_next;
+    cp_map_next = (i + 1) % ARRAY_SIZE(cp_map_writes);
+    cp_map_count = MIN(cp_map_count + 1, ARRAY_SIZE(cp_map_writes));
+    cp_map_writes[i].owner = s;
+    cp_map_writes[i].source = source;
+    cp_map_writes[i].reg = reg;
+    cp_map_writes[i].old = old;
+    cp_map_writes[i].val = val;
+    cp_map_writes[i].reset_gen = s->reset_gen;
+    cp_map_writes[i].draw = s->r3 ? s->r3->draws : 0;
+    cp_map_writes[i].bql = bql_locked();
+}
 
-    bool aic_on = (s->regs.aic_ctrl & 1) != 0;
-    bool aic_in_range = ib_base >= s->regs.aic_lo_addr &&
-                         ib_base <= s->regs.aic_hi_addr;
-    uint32_t pt_base = (s->r300 && s->r300_aic_pt_base) ? s->r300_aic_pt_base
-                                                          : s->regs.aic_pt_base;
-    uint32_t aic_pte = 0;
-    bool aic_pte_ok = false;
-    if (aic_on && aic_in_range && pt_base) {
-        uint32_t page_idx = (ib_base - s->regs.aic_lo_addr) >> 12;
-        hwaddr pte_addr = (hwaddr)pt_base + page_idx * 4;
-        aic_pte_ok = address_space_read(&address_space_memory, pte_addr,
-                                         MEMTXATTRS_UNSPECIFIED, &aic_pte,
-                                         4) == MEMTX_OK;
+static void ppc_mac_gpu_cp_read_good(PPCMacGPUState *s, unsigned kind,
+                                     const PPCMacGPUCPReadTrace *read)
+{
+    if (cp_last_good[kind].owner != s) {
+        cp_last_good[kind].count = 0;
     }
+    cp_last_good[kind].owner = s;
+    cp_last_good[kind].count++;
+    cp_last_good[kind].read = *read;
+    cp_last_good[kind].aic_ctrl = s->regs.aic_ctrl;
+    cp_last_good[kind].lo = s->regs.aic_lo_addr;
+    cp_last_good[kind].hi = s->regs.aic_hi_addr;
+    cp_last_good[kind].pt = s->regs.aic_pt_base;
+    cp_last_good[kind].r300_pt = s->r300_aic_pt_base;
+    cp_last_good[kind].agp = s->regs.mc_agp_location;
+    cp_last_good[kind].fb = s->regs.mc_fb_location;
+    cp_last_good[kind].bridge = uninorth_get_agp_gart_base();
+    cp_last_good[kind].bridge_gen = uninorth_get_agp_gart_gen();
+    cp_last_good[kind].pci_command = pci_get_word(s->pci.config + PCI_COMMAND);
+    cp_last_good[kind].reset_gen = s->reset_gen;
+}
 
-    uint32_t agp_loc = s->regs.mc_agp_location;
-    uint32_t agp_start = (agp_loc & 0xFFFF) << 16;
-    uint32_t agp_end = (((agp_loc >> 16) & 0xFFFF) << 16) | 0xFFFF;
-    bool agp_in_range = agp_loc != 0 && ib_base >= agp_start &&
-                         ib_base <= agp_end;
+static void ppc_mac_gpu_cp_dump_read(const char *label,
+                                      const PPCMacGPUCPReadTrace *r)
+{
+    qemu_log("ppc-mac-gpu: CP diag %s base=%08x size=%u page_addr=%08x "
+             "run=%u path=%s phys=%"PRIx64" data_read=%d data_tx=%x\n",
+             label, r->base, r->size_dw, r->addr, r->run, r->path,
+             (uint64_t)r->phys, r->data_read, r->tx);
+    const PPCMacGPUXlatTrace *paths[] = { &r->aic, &r->agp };
+    for (unsigned i = 0; i < ARRAY_SIZE(paths); i++) {
+        const PPCMacGPUXlatTrace *t = paths[i];
+        qemu_log("ppc-mac-gpu: CP diag %s %s=%s table=%"PRIx64
+                 " idx=%u pte_addr=%"PRIx64" pte_le=%08x pte_tx=%x\n",
+                 label, i ? "agp" : "aic", t->reason, (uint64_t)t->table,
+                 t->page_idx, (uint64_t)t->pte_addr, t->pte, t->tx);
+    }
+}
 
-    qemu_log("ppc-mac-gpu: IB lost diag base=%08x: "
-             "aic_ctrl=%08x(on=%d) aic_lo=%08x aic_hi=%08x in_range=%d "
-             "pt_base=%08x(r300=%d) pte_read_ok=%d pte=%08x | "
-             "mc_agp_location=%08x agp=[%08x,%08x] in_range=%d | "
-             "mc_fb_location=%08x vram_size=%08llx stall_lost=%llu "
-             "stall_done=%llu\n",
-             ib_base, s->regs.aic_ctrl, aic_on, s->regs.aic_lo_addr,
-             s->regs.aic_hi_addr, aic_in_range, pt_base, s->r300,
-             aic_pte_ok, aic_pte, agp_loc, agp_start, agp_end, agp_in_range,
-             s->regs.mc_fb_location, (unsigned long long)s->vram_size,
-             (unsigned long long)s->regs.stall_ib_lost,
-             (unsigned long long)s->regs.stall_ib_done);
+static void ppc_mac_gpu_dump_ib_lost_diag(PPCMacGPUState *s,
+                                          const PPCMacGPUCPReadTrace *read,
+                                          bool ring)
+{
+    static unsigned budgets[2] = { 5, 5 };
+    if (!budgets[ring]) {
+        return;
+    }
+    budgets[ring]--;
+
+    qemu_log("ppc-mac-gpu: %s lost diag source=%s depth=%d bql=%d "
+             "draw=%llu reset=%u pci_command=%04x dma_enabled=%d "
+             "rb=%08x cntl=%08x rptr=%08x wptr=%08x "
+             "ib_done=%llu ib_lost=%llu\n",
+             ring ? "RING" : "IB", cp_submission, g_in_pm4, bql_locked(),
+             (unsigned long long)(s->r3 ? s->r3->draws : 0), s->reset_gen,
+             pci_get_word(s->pci.config + PCI_COMMAND),
+             s->pci.bus_master_enable_region.enabled,
+             s->regs.cp_rb_base, s->regs.cp_rb_cntl, s->regs.cp_rb_rptr,
+             s->regs.cp_rb_wptr, (unsigned long long)s->regs.stall_ib_done,
+             (unsigned long long)s->regs.stall_ib_lost);
+    qemu_log("ppc-mac-gpu: CP diag current aic_ctrl=%08x lo=%08x hi=%08x "
+             "pt=%08x r300_pt=%08x r300=%d agp=%08x fb=%08x "
+             "bridge=%"PRIx64" bridge_gen=%u vram=%"PRIx64"\n",
+             s->regs.aic_ctrl, s->regs.aic_lo_addr, s->regs.aic_hi_addr,
+             s->regs.aic_pt_base, s->r300_aic_pt_base, s->r300,
+             s->regs.mc_agp_location, s->regs.mc_fb_location,
+             (uint64_t)uninorth_get_agp_gart_base(), uninorth_get_agp_gart_gen(),
+             (uint64_t)s->vram_size);
+    ppc_mac_gpu_cp_dump_read("failed", read);
+    for (unsigned i = 0; i < ARRAY_SIZE(cp_last_good); i++) {
+        if (cp_last_good[i].owner != s) {
+            qemu_log("ppc-mac-gpu: CP diag last-%s unavailable\n",
+                     i ? "ring" : "ib");
+            continue;
+        }
+        qemu_log("ppc-mac-gpu: CP diag last-%s count=%llu reset=%u "
+                 "aic_ctrl=%08x lo=%08x hi=%08x pt=%08x r300_pt=%08x "
+                 "agp=%08x fb=%08x bridge=%"PRIx64" bridge_gen=%u "
+                 "pci_command=%04x\n", i ? "ring" : "ib",
+                 (unsigned long long)cp_last_good[i].count,
+                 cp_last_good[i].reset_gen, cp_last_good[i].aic_ctrl,
+                 cp_last_good[i].lo, cp_last_good[i].hi, cp_last_good[i].pt,
+                 cp_last_good[i].r300_pt, cp_last_good[i].agp,
+                 cp_last_good[i].fb, (uint64_t)cp_last_good[i].bridge,
+                 cp_last_good[i].bridge_gen, cp_last_good[i].pci_command);
+        ppc_mac_gpu_cp_dump_read(i ? "last-ring" : "last-ib",
+                                  &cp_last_good[i].read);
+    }
+    for (unsigned n = 0; n < cp_map_count; n++) {
+        unsigned i = (cp_map_next + ARRAY_SIZE(cp_map_writes) -
+                      cp_map_count + n) % ARRAY_SIZE(cp_map_writes);
+        if (cp_map_writes[i].owner == s) {
+            qemu_log("ppc-mac-gpu: CP diag map-write source=%s "
+                     "reg=%04x old=%08x new=%08x draw=%llu reset=%u "
+                     "bql=%d\n", cp_map_writes[i].source,
+                     cp_map_writes[i].reg, cp_map_writes[i].old,
+                     cp_map_writes[i].val,
+                     (unsigned long long)cp_map_writes[i].draw,
+                     cp_map_writes[i].reset_gen, cp_map_writes[i].bql);
+        }
+    }
 }
 
 /*
@@ -9187,7 +9370,12 @@ static void ppc_mac_gpu_execute_ib(PPCMacGPUState *s,
     gpu_debug_log("IB_EXEC base=0x%x size=%u dwords", ib_base, ib_size_dw);
 
     /* Try GART translation first (IB is usually in system RAM) */
-    uint32_t *ib_data = ppc_mac_gpu_read_ib_via_gart(s, ib_base, ib_size_dw);
+    PPCMacGPUCPReadTrace read;
+    uint32_t *ib_data = ppc_mac_gpu_read_ib_via_gart(s, ib_base, ib_size_dw,
+                                                   &read);
+    if (ib_data) {
+        ppc_mac_gpu_cp_read_good(s, 0, &read);
+    }
 
     if (!ib_data) {
         /* GART failed - try reading from VRAM */
@@ -9196,7 +9384,7 @@ static void ppc_mac_gpu_execute_ib(PPCMacGPUState *s,
             gpu_debug_log("IB_EXEC: neither GART nor VRAM (base=0x%x)", ib_base);
             qemu_log("ppc-mac-gpu: IB lost (not in GART or VRAM): base=%08x size=%u\n",
                      ib_base, ib_size_dw);
-            ppc_mac_gpu_dump_ib_lost_diag(s, ib_base);
+            ppc_mac_gpu_dump_ib_lost_diag(s, &read, false);
             s->regs.stall_ib_lost++;
             return;
         }
@@ -9259,18 +9447,24 @@ static void ppc_mac_gpu_process_ring_buffer(PPCMacGPUState *s,
         uint32_t offset_dw = (old_rptr + i) & ring_mask;
         uint32_t run = MIN(count - i, ring_mask + 1 - offset_dw);
 
+        PPCMacGPUCPReadTrace read;
         if (!ppc_mac_gpu_read_dwords(s, s->regs.cp_rb_base + offset_dw * 4,
-                                     rb_data + i, run)) {
+                                     rb_data + i, run, &read)) {
+            ppc_mac_gpu_dump_ib_lost_diag(s, &read, true);
             g_free(rb_data);
             return;
         }
+        ppc_mac_gpu_cp_read_good(s, 1, &read);
         i += run;
     }
 
     gpu_debug_log("RING: processing %u dwords (rptr=%u wptr=%u rb_bufsz=%u)",
                   count, old_rptr, new_wptr, rb_bufsz);
 
+    const char *saved_submission = cp_submission;
+    cp_submission = "ring";
     ppc_mac_gpu_process_pm4(s, rb_data, count);
+    cp_submission = saved_submission;
     g_free(rb_data);
 }
 
@@ -9341,6 +9535,8 @@ static void ppc_mac_gpu_pm4_fifo_push(PPCMacGPUState *s, uint32_t val)
         s->pm4_pkt_count--;
 
         if (s->pm4_pkt_count == 0) {
+            const char *saved_submission = cp_submission;
+            cp_submission = "pio";
             if (s->pm4_pkt_reg != 0xFFFFFFFF) {
                 /* Type 0 complete - execute register writes */
                 ppc_mac_gpu_pm4_process_type0(s, s->pm4_pkt_reg,
@@ -9362,6 +9558,7 @@ static void ppc_mac_gpu_pm4_fifo_push(PPCMacGPUState *s, uint32_t val)
                     ppc_mac_gpu_process_pm4(s, pm4_buf, ndw + 1);
                 }
             }
+            cp_submission = saved_submission;
             s->pm4_fifo_idx = 0;
         }
     }
@@ -10585,6 +10782,8 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         }
     }
     if (s->r300 && addr == 0x0AB0) {
+        ppc_mac_gpu_cp_map_write(s, addr, s->r300_aic_pt_base, val & ~0xFFFu,
+                                  cp_submission);
         s->r300_aic_pt_base = val & ~0xFFFu;    /* PCI GART table base */
         r200_agp_tc_flush();
     }
@@ -10635,9 +10834,13 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         s->regs.config_cntl = val;
         break;
     case R200_MC_FB_LOCATION:
+        ppc_mac_gpu_cp_map_write(s, addr, s->regs.mc_fb_location, val,
+                                  cp_submission);
         s->regs.mc_fb_location = val;
         break;
     case R200_MC_AGP_LOCATION:
+        ppc_mac_gpu_cp_map_write(s, addr, s->regs.mc_agp_location, val,
+                                  cp_submission);
         s->regs.mc_agp_location = val;
         break;
 
@@ -11147,18 +11350,26 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
 
     /* GART (AGP Intelligent Controller) registers */
     case R200_AIC_CTRL:           /* 0x01D0 */
+        ppc_mac_gpu_cp_map_write(s, addr, s->regs.aic_ctrl, val,
+                                  cp_submission);
         s->regs.aic_ctrl = val;
         gpu_debug_log("GART AIC_CTRL=0x%x (enabled=%d)", (uint32_t)val, (uint32_t)val & 1);
         break;
     case R200_AIC_PT_BASE:        /* 0x01D8 */
+        ppc_mac_gpu_cp_map_write(s, addr, s->regs.aic_pt_base, val,
+                                  cp_submission);
         s->regs.aic_pt_base = val;
         gpu_debug_log("GART PT_BASE=0x%x", (uint32_t)val);
         break;
     case R200_AIC_LO_ADDR:        /* 0x01DC */
+        ppc_mac_gpu_cp_map_write(s, addr, s->regs.aic_lo_addr, val,
+                                  cp_submission);
         s->regs.aic_lo_addr = val;
         gpu_debug_log("GART LO_ADDR=0x%x", (uint32_t)val);
         break;
     case R200_AIC_HI_ADDR:        /* 0x01E0 */
+        ppc_mac_gpu_cp_map_write(s, addr, s->regs.aic_hi_addr, val,
+                                  cp_submission);
         s->regs.aic_hi_addr = val;
         gpu_debug_log("GART HI_ADDR=0x%x", (uint32_t)val);
         break;
@@ -12254,8 +12465,11 @@ static uint32_t ppc_mac_gpu_config_read(PCIDevice *dev,
 static void ppc_mac_gpu_config_write(PCIDevice *dev,
                                       uint32_t addr, uint32_t val, int len)
 {
+    uint16_t old_command = pci_get_word(dev->config + PCI_COMMAND);
     gpu_debug_log("CFG_WR off=0x%02x len=%d val=0x%x", addr, len, val);
     pci_default_write_config(dev, addr, val, len);
+    ppc_mac_gpu_cp_map_write(PPC_MAC_GPU(dev), PCI_COMMAND, old_command,
+                              pci_get_word(dev->config + PCI_COMMAND), "pci");
 }
 
 static void ppc_mac_gpu_exit(PCIDevice *dev)
