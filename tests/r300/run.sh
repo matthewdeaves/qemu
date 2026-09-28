@@ -15,6 +15,7 @@ mkdir -p "$B"
 python3 test_cp_reads.py
 python3 test_pm4_ring.py
 python3 test_2d_packet_headers.py
+python3 test_texview_bounds.py
 R=../../hw/display/r300
 SRC="$R/r300_state.c $R/r300_pvs.c $R/r300_us.c $R/r300_draw.c"
 for t in test_pvs test_us test_draw test_features test_upload test_clear test_lightlog; do

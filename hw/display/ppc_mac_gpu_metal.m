@@ -74,6 +74,26 @@ void *ppc_mac_gpu_metal_alloc_vram(uint64_t vram_size, void **opaque_out)
             qemu_log("ppc-mac-gpu-metal: no Metal device for VRAM alloc\n");
             return NULL;
         }
+        /*
+         * The shaders read the colour and depth they blend into with
+         * framebuffer fetch ([[color(n)]] inputs), and render into linear
+         * texture views of this shared buffer -- only Apple GPUs do either.
+         * An Intel or AMD GPU (an older Intel Mac, or an eGPU) would create
+         * a device here successfully and then fail obscurely later, deep in
+         * shader compilation or a draw call, instead of here where the
+         * cause is clear (qemu#22, adapted from poweremu-qemu 41a68f6 --
+         * that fork has a Vulkan/MoltenVK fallback to point users at; we
+         * don't, so this falls back to plain QEMU RAM/software the same
+         * way "no Metal device" above already does, rather than hard
+         * erroring the whole device).
+         */
+        if (![dev supportsFamily:MTLGPUFamilyApple1]) {
+            qemu_log("ppc-mac-gpu-metal: %s is not an Apple GPU; the "
+                     "accelerated Metal renderer needs one -- falling back\n",
+                     [[dev name] UTF8String]);
+            [dev release];
+            return NULL;
+        }
 
         /* Shared storage: CPU and GPU access the same physical memory.
          * This is the key to zero-copy — guest CPU writes are instantly
@@ -2488,6 +2508,33 @@ static NSUInteger mtl_linear_align(id<MTLDevice> dev, MTLPixelFormat pf)
         align[pf] = [dev minimumLinearTextureAlignmentForPixelFormat:pf];
     }
     return align[pf];
+}
+
+/*
+ * Bytes per texel for every pixel format r200_view() is ever asked to build
+ * a linear VRAM view in (qemu#22). 0 for anything else -- callers treat that
+ * as "can't verify", not "definitely fits", same as before this existed.
+ */
+static uint32_t mtl_bytes_per_element(MTLPixelFormat pf)
+{
+    switch (pf) {
+    case MTLPixelFormatR8Unorm:
+    case MTLPixelFormatR8Uint:
+        return 1;
+    case MTLPixelFormatRG8Unorm:
+    case MTLPixelFormatR16Uint:
+        return 2;
+    case MTLPixelFormatBGRA8Unorm:
+    case MTLPixelFormatRGBA8Unorm:
+    case MTLPixelFormatR32Uint:
+        return 4;
+    case MTLPixelFormatRG32Uint:
+        return 8;
+    case MTLPixelFormatRGBA32Uint:
+        return 16;
+    default:
+        return 0;
+    }
 }
 
 /* Bring-up diagnostics: real per-draw work (CRC scans, probes), off by default. */
@@ -6221,6 +6268,77 @@ static bool r200_batch_conflict(uint64_t lo, uint64_t hi, const R200TexKey *same
 }
 static int64_t g_r200_stat_flush_us;
 
+/*
+ * A linear MTLTexture view's bytesPerRow must cover a full row of the width
+ * it claims, or Metal aborts the process outright (a guest can reach this:
+ * an inconsistent pitch/width pair is just a bad register write, not
+ * something the emulator itself constrains). Decide, before ever calling
+ * newTextureWithDescriptor:offset:bytesPerRow:, whether *width needs
+ * shrinking to fit (sampled texture) or the view must be refused outright
+ * (render target -- can't shrink one without losing rows the guest expects
+ * to be there). Pure decision, no Metal calls, so it's extractable for
+ * testing without a real device (qemu#22, ported from poweremu-qemu
+ * f0e414a -- upstream's r200_view has the same shared-helper shape this one
+ * does). Returns false when the caller must refuse the view (*width is
+ * untouched in that case); true otherwise, with *width already adjusted if
+ * needed.
+ */
+static bool r200_view_fits(MTLPixelFormat pf, uint32_t pitch,
+                            uint32_t *width, bool render_target)
+{
+    uint32_t bpe = mtl_bytes_per_element(pf);
+    if (!bpe || (uint64_t)pitch >= (uint64_t)*width * bpe) {
+        return true;                    /* fits, or an unverifiable format */
+    }
+    if (render_target) {
+        return false;
+    }
+    *width = pitch / bpe;
+    return *width != 0;
+}
+
+/*
+ * A linear MTLTexture view must not run past the end of the VRAM buffer
+ * either, or Metal aborts the same way (qemu#22, same source as
+ * r200_view_fits above -- upstream folds both checks into one function;
+ * kept separate here since each is independently testable and most call
+ * sites already validate offset/height bounds themselves -- but not all:
+ * metal_draw_r200()'s colour render target (`rk`) checks alignment only,
+ * never total VRAM bounds, unlike its own texture-unit and depth-buffer
+ * views a few lines above it, and unlike metal_draw_r300()'s equivalent
+ * colour buffer). Pure decision, no Metal calls: shrinks *height for a
+ * sampled texture whose rows run past the buffer end (sampling past the
+ * shrunk rows clamps, same reasoning as the width shrink above); a render
+ * target that doesn't fit is refused outright. Call with the (possibly
+ * already width-shrunk) width from r200_view_fits.
+ */
+static bool r200_view_in_bounds(uint32_t offset, uint32_t pitch, uint32_t bpe,
+                                 uint32_t width, uint32_t *height,
+                                 uint64_t vram_len, bool render_target)
+{
+    if (!bpe || !*height || !pitch) {
+        return true;                       /* unverifiable, or nothing to check */
+    }
+    if (offset >= vram_len ||
+        (uint64_t)offset + (uint64_t)width * bpe > vram_len) {
+        return false;           /* doesn't fit even at height 1 -- no shrink helps */
+    }
+    uint64_t need = (uint64_t)offset + (uint64_t)(*height - 1) * pitch +
+                    (uint64_t)width * bpe;
+    if (need <= vram_len) {
+        return true;
+    }
+    if (render_target) {
+        return false;
+    }
+    uint32_t h = (uint32_t)((vram_len - offset - (uint64_t)width * bpe) / pitch) + 1;
+    if (!h) {
+        return false;
+    }
+    *height = h;
+    return true;
+}
+
 /* Linear texture view over VRAM, cached; views stay alive while cached. */
 static id<MTLTexture> r200_view(PPCMacGPUMetalState *st, R200TexKey k,
                                 MTLPixelFormat pf, bool render_target)
@@ -6236,8 +6354,31 @@ static id<MTLTexture> r200_view(PPCMacGPUMetalState *st, R200TexKey k,
             lru = i;
         }
     }
+
+    uint32_t width = k.width;
+    if (!r200_view_fits(pf, k.pitch, &width, render_target)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ppc-mac-gpu-metal: %s pitch too small for its width "
+                      "(pitch=%u width=%u bpe=%u)\n",
+                      render_target ? "render target" : "texture",
+                      k.pitch, k.width, mtl_bytes_per_element(pf));
+        return nil;
+    }
+    uint32_t height = k.height;
+    if (!r200_view_in_bounds(k.offset, k.pitch, mtl_bytes_per_element(pf),
+                              width, &height, st->vramBuffer.length,
+                              render_target)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ppc-mac-gpu-metal: %s view outside VRAM "
+                      "(offset=0x%x pitch=%u height=%u vram=%llu)\n",
+                      render_target ? "render target" : "texture",
+                      k.offset, k.pitch, k.height,
+                      (unsigned long long)st->vramBuffer.length);
+        return nil;
+    }
+
     MTLTextureDescriptor *d = [MTLTextureDescriptor
-        texture2DDescriptorWithPixelFormat:pf width:k.width height:k.height
+        texture2DDescriptorWithPixelFormat:pf width:width height:height
                                  mipmapped:NO];
     d.usage = MTLTextureUsageShaderRead |
               (render_target ? MTLTextureUsageRenderTarget : 0);
