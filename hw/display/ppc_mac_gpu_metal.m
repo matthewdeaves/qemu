@@ -39,6 +39,8 @@
 
 FrameTracker *g_frame_tracker = NULL;
 
+static bool metal_flush_r200(void *opaque);
+
 /* ========================================================================
  * Zero-copy unified VRAM — MTLBuffer shared with guest CPU
  *
@@ -3110,6 +3112,12 @@ static int metal_draw_3d(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         return -1;
     }
 
+    /* Legacy packet opcodes can follow direct R200/R300 draws.  A split
+     * now leaves their command buffer uncommitted; finish it before this
+     * path reads VRAM on the CPU or submits its separate render/blit buffer.
+     * Waiting on the split fence in that buffer cannot order CPU accesses. */
+    metal_flush_r200(st);
+
     static int metal_draw_count = 0;
     int draw_num = metal_draw_count++;
     bool verbose = r200_diag_on() &&
@@ -5898,6 +5906,8 @@ static uint64_t g_r200_view_clock;
 static id<MTLCommandBuffer> g_r200_cb;
 static id<MTLCommandBuffer> g_r200_inflight;   /* newest committed, unwaited */
 static id<MTLRenderCommandEncoder> g_r200_enc;
+static id<MTLFence> g_r200_split_fence;
+static bool g_r200_fence_pending;
 static R200TexKey g_r200_enc_key;
 static bool g_r300_enc_mine;        /* open encoder belongs to draw_r300 */
 static uint32_t g_r200_enc_depth_off = ~0u, g_r200_enc_depth_pitch; /* ~0: none */
@@ -5938,9 +5948,9 @@ static int g_r200_nwritten;
 /*
  * Instead of stopping the vCPU until the GPU is done, a conflict can end
  * the batch and start a new one that the GPU runs only after the previous
- * one completes (a shared event signalled at the end of each batch and
- * waited for at the start of the next).  The written ranges stay for the
- * CPU-side checks; conflicts only look at the current batch's (epoch).
+ * one completes (fences between render passes, a shared event between
+ * command buffers).  The written ranges stay for the CPU-side checks;
+ * conflicts only look at the current batch's (epoch).
  * PPCGPU_SPLIT=0 goes back to waiting.
  */
 static uint32_t g_r200_epoch;
@@ -5969,6 +5979,15 @@ static bool r200_split_enabled(void)
 /* A new command buffer, ordered after everything committed before it. */
 static id<MTLCommandBuffer> r200_new_cb(PPCMacGPUMetalState *st)
 {
+    /* Splits no longer create the event, but real submissions still need
+     * it: queue commit order alone does not order accesses via aliased
+     * VRAM views.  Initialize it before the first buffer can be committed. */
+    if (!g_r200_event) {
+        g_r200_event = [st->device newSharedEvent];
+    }
+    if (r200_split_enabled() && !g_r200_split_fence) {
+        g_r200_split_fence = [st->device newFence];
+    }
     int64_t t0 = g_get_monotonic_time();
     id<MTLCommandBuffer> cb = [[st->commandQueue commandBuffer] retain];
     g_r200_stat_new_cb_us += g_get_monotonic_time() - t0;
@@ -6241,18 +6260,52 @@ static id<MTLTexture> r200_view(PPCMacGPUMetalState *st, R200TexKey k,
 
 static uint32_t g_r200_seq;
 
+/*
+ * A batch can span several render targets.  Fencing only the encoder open
+ * at a split misses earlier producers; consuming that fence only once also
+ * leaves later passes unordered against the old epoch.  Chain every pass
+ * boundary so the split orders all earlier reads/writes before all later
+ * passes, including boundaries caused by a target change or a failed draw.
+ */
+static void r200_end_encoder(void)
+{
+    if (g_r200_enc) {
+        if (g_r200_split_fence) {
+            [g_r200_enc updateFence:g_r200_split_fence
+                       afterStages:MTLRenderStageFragment];
+            g_r200_fence_pending = true;
+        }
+        [g_r200_enc endEncoding];
+        [g_r200_enc release];
+        g_r200_enc = nil;
+    }
+    g_r200_enc_depth_off = ~0u;
+}
+
+static bool r200_begin_encoder(MTLRenderPassDescriptor *rp)
+{
+    g_r200_enc = [[g_r200_cb renderCommandEncoderWithDescriptor:rp] retain];
+    if (!g_r200_enc) {
+        /* A message to nil would silently discard the pending dependency. */
+        return false;
+    }
+    if (g_r200_fence_pending) {
+        /* VRAM reads/writes and attachment loads run in the fragment stage;
+         * a vertex-only wait does not explicitly cover those operations. */
+        [g_r200_enc waitForFence:g_r200_split_fence
+                   beforeStages:MTLRenderStageVertex | MTLRenderStageFragment];
+        g_r200_fence_pending = false;
+    }
+    return true;
+}
+
 /* Close the open batch and commit it; returns its sequence number or 0. */
 static uint32_t r200_commit(void (*done)(void *, uint32_t), void *arg)
 {
     if (!g_r200_cb) {
         return 0;
     }
-    if (g_r200_enc) {
-        [g_r200_enc endEncoding];
-        [g_r200_enc release];
-        g_r200_enc = nil;
-    }
-    g_r200_enc_depth_off = ~0u;
+    r200_end_encoder();
     uint32_t seq = ++g_r200_seq;
     if (seq == 0) {
         seq = ++g_r200_seq;
@@ -6295,6 +6348,8 @@ static bool metal_flush_r200(void *opaque)
     }
     [g_r200_inflight release];
     g_r200_inflight = nil;
+    /* Completion also retires a fence with no subsequent consuming pass. */
+    g_r200_fence_pending = false;
     g_r200_nwritten = 0;
     r200_readmap_clear(&g_r200_reads_batch);
     r200_readmap_clear(&g_r200_reads_inflight);
@@ -6311,15 +6366,11 @@ static bool metal_flush_r200(void *opaque)
  * stall into metal_flush_r200's real wait, total time conserved) confirmed
  * the cost is genuine GPU back-pressure, not a software cap alone. This
  * fence instead orders the split within the SAME still-open command
- * buffer, so a split costs one MTLFence update/wait (an existing
- * per-render-target-change encoder boundary already pays that shape of
- * cost every draw that changes target) instead of a whole new command
- * buffer + queue-depth wait. g_r200_event (below) still orders separate
- * command buffers at real flush/submit boundaries -- unrelated, unchanged.
+ * buffer.  Each render-pass boundary participates in the fence chain,
+ * so a split costs an update/wait instead of a whole new command
+ * buffer + queue-depth wait. g_r200_event still orders separate
+ * command buffers at real flush/submit boundaries.
  */
-static id<MTLFence> g_r200_split_fence;
-static bool g_r200_fence_pending;
-
 /*
  * End the batch for a hazard without stopping the vCPU: the next batch
  * starts on the GPU only after this one completes, so its draws may
@@ -6329,21 +6380,12 @@ static bool g_r200_fence_pending;
  */
 static void r200_split(PPCMacGPUMetalState *st)
 {
-    if (!r200_split_enabled()) {
+    if (!r200_split_enabled() || !g_r200_split_fence) {
+        /* If fence allocation failed, preserve ordering with a CPU wait. */
         metal_flush_r200(st);
         return;
     }
-    if (!g_r200_split_fence) {
-        g_r200_split_fence = [st->device newFence];
-    }
-    if (g_r200_enc) {
-        [g_r200_enc updateFence:g_r200_split_fence afterStages:MTLRenderStageFragment];
-        [g_r200_enc endEncoding];
-        [g_r200_enc release];
-        g_r200_enc = nil;
-        g_r200_fence_pending = true;
-    }
-    g_r200_enc_depth_off = ~0u;
+    r200_end_encoder();
     g_r200_epoch++;
     r200_readmap_clear(&g_r200_reads_batch);
     g_r200_stat_splits++;
@@ -6776,9 +6818,7 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             (g_r300_enc_mine || memcmp(&g_r200_enc_key, &rk, sizeof(rk)) ||
              (want_ds && (!enc_ds || g_r200_enc_depth_off != pkt->depth_offset ||
                           g_r200_enc_depth_pitch != pkt->depth_pitch)))) {
-            [g_r200_enc endEncoding];
-            [g_r200_enc release];
-            g_r200_enc = nil;
+            r200_end_encoder();
         }
         if (!g_r200_enc) {
             id<MTLTexture> rt = r200_view(st, rk, rtpf, true);
@@ -6822,10 +6862,9 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             } else {
                 g_r200_enc_depth_off = ~0u;
             }
-            g_r200_enc = [[g_r200_cb renderCommandEncoderWithDescriptor:rp] retain];
-            if (g_r200_fence_pending) {
-                [g_r200_enc waitForFence:g_r200_split_fence beforeStages:MTLRenderStageVertex];
-                g_r200_fence_pending = false;
+            if (!r200_begin_encoder(rp)) {
+                r200_metal_warn(4, "render encoder creation failed", 0, 0);
+                return -1;
             }
             g_r300_enc_mine = false;
             /* The R200 does not clip on z for these draws: a depth clear drawn
@@ -7924,9 +7963,7 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                                   g_r200_enc_depth_pitch != zd->pitch ||
                                   g_r200_enc_depth_z16 != (zd->bpp == 2)));
         if (g_r200_enc && !same) {
-            [g_r200_enc endEncoding];
-            [g_r200_enc release];
-            g_r200_enc = nil;
+            r200_end_encoder();
         }
         if (!g_r200_enc) {
             MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -7956,10 +7993,9 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             } else {
                 g_r200_enc_depth_off = ~0u;
             }
-            g_r200_enc = [[g_r200_cb renderCommandEncoderWithDescriptor:rp] retain];
-            if (g_r200_fence_pending) {
-                [g_r200_enc waitForFence:g_r200_split_fence beforeStages:MTLRenderStageVertex];
-                g_r200_fence_pending = false;
+            if (!r200_begin_encoder(rp)) {
+                r300_metal_warn(4, "render encoder creation failed");
+                return -1;
             }
             [g_r200_enc setDepthClipMode:MTLDepthClipModeClamp];
             [g_r200_enc setViewport:(MTLViewport){ 0, 0, pkt->rt_width,

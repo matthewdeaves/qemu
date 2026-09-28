@@ -22,6 +22,7 @@ clang -O1 -fobjc-arc -framework Metal -framework Foundation test_zs.m $SRC -o "$
 clang -O1 -fobjc-arc -framework Metal -framework Foundation test_fmt.m $SRC -o "$B/test_fmt"
 clang -O1 -fobjc-arc -framework Metal -framework Foundation test_raster.m $SRC -o "$B/test_raster"
 clang -O1 -framework Metal -framework Foundation test_archive.m "$R/r300_metal_cache.m" -o "$B/test_archive"
+clang -O1 -framework Metal -framework Foundation test_fence.m -o "$B/test_fence"
 "$B/test_pvs"
 "$B/test_draw"
 "$B/test_upload"
@@ -36,4 +37,5 @@ CACHE=$(mktemp -d "$B/archive.XXXXXX")
 trap 'rm -rf "$CACHE"' 0
 "$B/test_archive" "$CACHE"
 "$B/test_archive" "$CACHE" --warm
+"$B/test_fence"
 echo "all R300 tests passed"
