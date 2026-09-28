@@ -6304,9 +6304,27 @@ static bool metal_flush_r200(void *opaque)
 }
 
 /*
+ * qemu#17: r200_new_cb's own timing counter showed -[MTLCommandQueue
+ * commandBuffer] costing an average of 155us/call over a run with ~42,600
+ * splits -- 34.5% of one demo1 run's wall-clock -- and a candidate fix that
+ * raised the queue's in-flight cap (tested, reverted: it only moved the
+ * stall into metal_flush_r200's real wait, total time conserved) confirmed
+ * the cost is genuine GPU back-pressure, not a software cap alone. This
+ * fence instead orders the split within the SAME still-open command
+ * buffer, so a split costs one MTLFence update/wait (an existing
+ * per-render-target-change encoder boundary already pays that shape of
+ * cost every draw that changes target) instead of a whole new command
+ * buffer + queue-depth wait. g_r200_event (below) still orders separate
+ * command buffers at real flush/submit boundaries -- unrelated, unchanged.
+ */
+static id<MTLFence> g_r200_split_fence;
+static bool g_r200_fence_pending;
+
+/*
  * End the batch for a hazard without stopping the vCPU: the next batch
- * starts on the GPU only after this one completes (r200_new_cb), so its
- * draws may overwrite what this one sampled or read what it rendered.
+ * starts on the GPU only after this one completes, so its draws may
+ * overwrite what this one sampled or read what it rendered. Ordered via a
+ * fence within the still-open command buffer (see above), not a new one.
  * PPCGPU_SPLIT=0 waits instead.
  */
 static void r200_split(PPCMacGPUMetalState *st)
@@ -6315,10 +6333,17 @@ static void r200_split(PPCMacGPUMetalState *st)
         metal_flush_r200(st);
         return;
     }
-    if (!g_r200_event) {
-        g_r200_event = [st->device newSharedEvent];
+    if (!g_r200_split_fence) {
+        g_r200_split_fence = [st->device newFence];
     }
-    r200_commit(NULL, NULL);
+    if (g_r200_enc) {
+        [g_r200_enc updateFence:g_r200_split_fence afterStages:MTLRenderStageFragment];
+        [g_r200_enc endEncoding];
+        [g_r200_enc release];
+        g_r200_enc = nil;
+        g_r200_fence_pending = true;
+    }
+    g_r200_enc_depth_off = ~0u;
     g_r200_epoch++;
     r200_readmap_clear(&g_r200_reads_batch);
     g_r200_stat_splits++;
@@ -6798,6 +6823,10 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                 g_r200_enc_depth_off = ~0u;
             }
             g_r200_enc = [[g_r200_cb renderCommandEncoderWithDescriptor:rp] retain];
+            if (g_r200_fence_pending) {
+                [g_r200_enc waitForFence:g_r200_split_fence beforeStages:MTLRenderStageVertex];
+                g_r200_fence_pending = false;
+            }
             g_r300_enc_mine = false;
             /* The R200 does not clip on z for these draws: a depth clear drawn
              * exactly at z = 1.0 (Chess) would be clipped away by Metal. */
@@ -7928,6 +7957,10 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                 g_r200_enc_depth_off = ~0u;
             }
             g_r200_enc = [[g_r200_cb renderCommandEncoderWithDescriptor:rp] retain];
+            if (g_r200_fence_pending) {
+                [g_r200_enc waitForFence:g_r200_split_fence beforeStages:MTLRenderStageVertex];
+                g_r200_fence_pending = false;
+            }
             [g_r200_enc setDepthClipMode:MTLDepthClipModeClamp];
             [g_r200_enc setViewport:(MTLViewport){ 0, 0, pkt->rt_width,
                                                   pkt->rt_height, 0, 1 }];
