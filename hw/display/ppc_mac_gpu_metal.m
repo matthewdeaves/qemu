@@ -7771,14 +7771,36 @@ static id<MTLTexture> r300_texture(PPCMacGPUMetalState *st, id<MTLDevice> dev,
     default:              pf = MTLPixelFormatInvalid; break;
     }
     if (pf != MTLPixelFormatInvalid && td->host_data) {
-        /* Copied out of the GART by the device: upload as it lies. */
+        /* Copied out of the GART by the device: qemu#15. r300_texture_raw's
+         * own comment says GART dwords need byte-reversing to VRAM's side of
+         * the aperture before anything downstream (there: the RAW shader
+         * path; here: the fixed decode/swizzle set_textures() computed
+         * assuming VRAM's big-endian layout) can treat them the same as a
+         * VRAM texel. RGBA8 skipped that reversal ("upload as it lies")
+         * while RAW does it -- a dynamic-light re-upload through this path
+         * (a lightmap texel touched by a projectile or muzzle flash) landed
+         * un-reversed bytes next to correctly-reversed static ones,
+         * producing a magenta cast confined to the just-relit texels.
+         * Normalize the same way RAW does, for RGBA8 only. */
+        const void *bytes = td->host_data;
+        uint32_t *swapped = NULL;
+        if (td->kind == R300_TEXK_RGBA8) {
+            size_t n = (size_t)td->pitch_bytes * td->height;
+            swapped = g_malloc(n);
+            memcpy(swapped, td->host_data, n);
+            for (size_t i = 0; i < n / 4; i++) {
+                swapped[i] = __builtin_bswap32(swapped[i]);
+            }
+            bytes = swapped;
+        }
         MTLTextureDescriptor *d = [MTLTextureDescriptor
             texture2DDescriptorWithPixelFormat:pf width:td->width
                                         height:td->height mipmapped:NO];
         d.usage = MTLTextureUsageShaderRead;
         id<MTLTexture> t = [[dev newTextureWithDescriptor:d] autorelease];
         [t replaceRegion:MTLRegionMake2D(0, 0, td->width, td->height)
-             mipmapLevel:0 withBytes:td->host_data bytesPerRow:td->pitch_bytes];
+             mipmapLevel:0 withBytes:bytes bytesPerRow:td->pitch_bytes];
+        g_free(swapped);
         return t;
     }
     if (pf != MTLPixelFormatInvalid) {
