@@ -7872,7 +7872,49 @@ static FILE *r300_ringdump(void)
     return f;
 }
 
-static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
+/* Defined below, alongside the rest of the CP diagnostic state; forward
+ * declared here so ppc_mac_gpu_process_pm4's deferred-packet log (which
+ * runs well before that point in the file) can tag its source. */
+static const char *cp_submission;
+
+/*
+ * Total dwords (header + body) a PM4 packet occupies in the stream, purely
+ * from its header -- shared by every caller that must know whether a
+ * packet fits before touching it (qemu#1).
+ *
+ * Type 1 (legacy) is always 2 fixed body dwords -- bits [29:16] there are a
+ * register index, not a count, unlike type 0/3.
+ */
+static uint32_t ppc_mac_gpu_pm4_packet_dw(uint32_t hdr)
+{
+    uint32_t type = (hdr >> 30) & 3;
+    if (type == 2) {
+        return 1;
+    }
+    if (type == 1) {
+        return 3;
+    }
+    return ((hdr >> 16) & 0x3FFF) + 2;
+}
+
+/*
+ * qemu#1: a packet whose declared length runs past size_dw is left
+ * unconsumed, header included, rather than dispatched short or read out of
+ * bounds. The caller (ring: ppc_mac_gpu_process_ring_buffer; IB:
+ * ppc_mac_gpu_execute_ib) must only acknowledge the dwords this function
+ * actually consumed -- an unconditional "everything up to here is done"
+ * turns an incomplete packet's still-unread tail into a bogus header the
+ * next submission decodes as new register writes (the qemu#1
+ * MC_FB_LOCATION/MC_AGP_LOCATION corruption that flooded "IB lost").
+ * Returns the number of dwords actually consumed in complete packets.
+ */
+static uint32_t ppc_mac_gpu_pm4_dispatch(PPCMacGPUState *s,
+                                          uint32_t *pm4_data,
+                                          uint32_t size_dw,
+                                          uint32_t hdr, uint32_t type,
+                                          uint32_t i);
+
+static uint32_t ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                                      uint32_t *pm4_data,
                                      uint32_t size_dw)
 {
@@ -7881,9 +7923,34 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
     while (i < size_dw) {
         uint32_t hdr = pm4_data[i];
         uint32_t type = (hdr >> 30) & 3;
+        uint32_t packet_dw = ppc_mac_gpu_pm4_packet_dw(hdr);
+
+        /* Leave an incomplete packet, header included, unconsumed (qemu#1):
+         * the caller must not acknowledge it as processed. Logged
+         * (rate-limited, with a running total) so a live run can confirm
+         * this actually fires -- i.e. that the guest really does bump
+         * WPTR/submit an IB mid-packet, the precondition the qemu#1
+         * corruption needed. Zero deferrals over a run long enough to have
+         * hung before means this fix, while still correct, was not what
+         * caused that particular hang. */
+        if (packet_dw > size_dw - i) {
+            static uint64_t deferred_count;
+            static unsigned deferred_budget = 20;
+            deferred_count++;
+            if (deferred_budget) {
+                deferred_budget--;
+                qemu_log("ppc-mac-gpu: PM4 deferred incomplete packet "
+                         "source=%s hdr=%08x type=%u need=%u have=%u "
+                         "depth=%d total=%"PRIu64"\n",
+                         cp_submission, hdr, type, packet_dw, size_dw - i,
+                         g_in_pm4, deferred_count);
+            }
+            break;
+        }
+
         FILE *rd = r300_ringdump();
         if (rd) {
-            uint32_t n = type == 2 ? 0 : ((hdr >> 16) & 0x3FFF) + 1;
+            uint32_t n = packet_dw - 1;
             fprintf(rd, "%c%u %08x:", "0123"[type], g_in_pm4, hdr);
             for (uint32_t k = 0; k < n && i + 1 + k < size_dw && k < 512; k++) {
                 fprintf(rd, " %08x", pm4_data[i + 1 + k]);
@@ -7891,7 +7958,27 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
             fputc('\n', rd);
         }
         i++;
+        i = ppc_mac_gpu_pm4_dispatch(s, pm4_data, size_dw, hdr, type, i);
+    }
+    g_in_pm4--;
+    return i;
+}
 
+/*
+ * Dispatches one already-validated, fully-present packet (the walker
+ * above only calls this once packet_dw dwords are confirmed to fit)
+ * and returns the new stream position -- i advanced by exactly this
+ * packet's own length. Split out from ppc_mac_gpu_process_pm4 so the
+ * walker's framing/consumption logic (qemu#1) can be extracted and
+ * tested on its own, with this function stubbed out by a recording
+ * test double (tests/r300/test_pm4_ring.py) -- no behavior change.
+ */
+static uint32_t ppc_mac_gpu_pm4_dispatch(PPCMacGPUState *s,
+                                          uint32_t *pm4_data,
+                                          uint32_t size_dw,
+                                          uint32_t hdr, uint32_t type,
+                                          uint32_t i)
+{
         if (type == 0) {
             /* Type 0: register write(s)
              * Bits [14:0]  = register index
@@ -7909,10 +7996,8 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                 vw_before = *(uint32_t *)(vp + 0x353000);
             }
 
-            if (i + pkt_count > size_dw) {
-                pkt_count = size_dw - i;
-            }
-
+            /* packet_dw's break above already guarantees this packet is
+             * fully present: pkt_count == packet_dw - 1 dwords always fit. */
             ppc_mac_gpu_pm4_process_type0(s, reg_base, one_reg_wr, pkt_count,
                                            &pm4_data[i]);
 
@@ -8055,7 +8140,7 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                 /* Need at least one complete (src, dst, size) triplet. */
                 if (body_dw < hdr_dw + 3) {
                     i += body_adv;
-                    continue;
+                    return i;
                 }
 
                 uint32_t dst_offset = (dst_po & 0x3FFFFF) << 10;
@@ -8074,7 +8159,7 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
 
                 if (dst_pitch == 0 || src_pitch == 0) {
                     i += body_adv;
-                    continue;
+                    return i;
                 }
 
                 uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
@@ -8619,7 +8704,7 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
 
                 if (pitch == 0) {
                     i += body_adv;
-                    continue;
+                    return i;
                 }
 
                 uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
@@ -9193,12 +9278,14 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
 
             i += body_adv;
         } else {
-            /* Type 1: skip data words */
-            uint32_t pkt_count = ((hdr >> 16) & 0x3FFF) + 1;
-            i += pkt_count;
+            /* Type 1 (legacy): always 2 body dwords -- bits [29:16] are a
+             * register index there, not a count (qemu#1: this used to read
+             * them as one, misaligning every packet after a type-1 header).
+             * Register-write semantics remain unimplemented. */
+            i += 2;
         }
-    }
-    g_in_pm4--;
+
+    return i;
 }
 
 /* Diagnostic history is bounded per process, like the original IB report.
@@ -9353,11 +9440,42 @@ static void ppc_mac_gpu_dump_ib_lost_diag(PPCMacGPUState *s,
  *
  * The IB address may be in VRAM or in the GART aperture (system RAM).
  * We try GART first; if that fails, fall back to VRAM.
+ *
+ * qemu#1: a nested IB is a fixed, complete buffer fetched fresh in this one
+ * call -- unlike the ring, there is no later call that "resumes" from where
+ * process_pm4 left off if it defers an incomplete trailing packet here (its
+ * return value used to be discarded outright). Track the last IB dispatched
+ * (whether or not it deferred) so a deferral inside THIS IB can be logged
+ * against where the previous IB ended, and so the IB that runs right after
+ * a deferral can be logged against where the deferring IB ended -- together
+ * that shows whether consecutive IBs are contiguous (the kext growing one
+ * logical buffer across BUFSZ writes -- carry the tail across IBs) or not
+ * (a size-decode bug scoped to the deferring IB alone). Diagnostic only --
+ * does not change what gets executed.
  */
+static struct {
+    bool valid, deferred;
+    uint32_t base, size_dw, consumed;
+} last_ib;
+
 static void ppc_mac_gpu_execute_ib(PPCMacGPUState *s,
                                     uint32_t ib_base,
                                     uint32_t ib_size_dw)
 {
+    if (last_ib.valid && last_ib.deferred) {
+        static unsigned next_budget = 20;
+        if (next_budget) {
+            next_budget--;
+            qemu_log("ppc-mac-gpu: IB after deferred tail: this base=%08x "
+                     "size=%u, deferring IB was base=%08x size=%u "
+                     "consumed=%u end=%08x gap=%d\n",
+                     ib_base, ib_size_dw, last_ib.base, last_ib.size_dw,
+                     last_ib.consumed, last_ib.base + last_ib.size_dw * 4,
+                     (int)ib_base - (int)(last_ib.base +
+                                           last_ib.size_dw * 4));
+        }
+    }
+
     if (r300_ringdump()) {
         fprintf(r300_ringdump(), "IB base=%08x size=%u\n", ib_base, ib_size_dw);
     }
@@ -9397,7 +9515,48 @@ static void ppc_mac_gpu_execute_ib(PPCMacGPUState *s,
 
     s->regs.stall_ib_done++;
     s->regs.stall_ib_dwords += ib_size_dw;
-    ppc_mac_gpu_process_pm4(s, ib_data, ib_size_dw);
+    uint32_t consumed = ppc_mac_gpu_process_pm4(s, ib_data, ib_size_dw);
+
+    if (consumed < ib_size_dw) {
+        static unsigned budget = 20;
+        if (budget) {
+            budget--;
+            uint32_t after[8] = { 0 };
+            PPCMacGPUCPReadTrace after_read;
+            bool have_after = ppc_mac_gpu_read_dwords(
+                s, ib_base + ib_size_dw * 4, after, 8, &after_read);
+
+            qemu_log("ppc-mac-gpu: IB deferred tail base=%08x size=%u "
+                     "consumed=%u prev_ib=%s prev_base=%08x prev_size=%u "
+                     "prev_consumed=%u prev_end=%08x gap=%d\n",
+                     ib_base, ib_size_dw, consumed,
+                     last_ib.valid ? "yes" : "no", last_ib.base,
+                     last_ib.size_dw, last_ib.consumed,
+                     last_ib.base + last_ib.size_dw * 4,
+                     last_ib.valid
+                         ? (int)ib_base - (int)(last_ib.base +
+                                                 last_ib.size_dw * 4)
+                         : 0);
+            if (have_after) {
+                qemu_log("ppc-mac-gpu: IB deferred tail: 8 dwords after "
+                         "this IB's end (base=%08x): "
+                         "%08x %08x %08x %08x %08x %08x %08x %08x\n",
+                         ib_base + ib_size_dw * 4,
+                         after[0], after[1], after[2], after[3],
+                         after[4], after[5], after[6], after[7]);
+            } else {
+                qemu_log("ppc-mac-gpu: IB deferred tail: could not read "
+                         "8 dwords after this IB's end (base=%08x)\n",
+                         ib_base + ib_size_dw * 4);
+            }
+        }
+    }
+
+    last_ib = (typeof(last_ib)){
+        .valid = true, .base = ib_base, .size_dw = ib_size_dw,
+        .consumed = consumed, .deferred = (consumed < ib_size_dw),
+    };
+
     g_free(ib_data);
 }
 
@@ -9413,6 +9572,17 @@ static void ppc_mac_gpu_execute_ib(PPCMacGPUState *s,
  *   - Ring size in DWords = 2 << rb_bufsz
  *   - RPTR and WPTR are in DWord units
  *   - Ring wraps at (ring_size_dw - 1)
+ */
+/*
+ * Advances CP_RB_RPTR by exactly the dwords actually consumed (in complete
+ * packets), never by the full (new_wptr - old_rptr) span the guest asked
+ * for. Every early return below (bad rb_bufsz, empty/oversized count, a
+ * failed ring read) used to be silently acknowledged as fully processed by
+ * the WPTR handler's unconditional rptr write that followed every call
+ * here, which is the same qemu#1 unconsumed-data-marked-done bug as an
+ * incomplete packet's dropped tail -- so cp_rb_rptr is left untouched
+ * (still old_rptr, via the caller's own read of it before this call) on
+ * every path that does not reach the "consumed" line below.
  */
 static void ppc_mac_gpu_process_ring_buffer(PPCMacGPUState *s,
                                              uint32_t old_rptr,
@@ -9463,9 +9633,30 @@ static void ppc_mac_gpu_process_ring_buffer(PPCMacGPUState *s,
 
     const char *saved_submission = cp_submission;
     cp_submission = "ring";
-    ppc_mac_gpu_process_pm4(s, rb_data, count);
+    uint32_t consumed = ppc_mac_gpu_process_pm4(s, rb_data, count);
     cp_submission = saved_submission;
     g_free(rb_data);
+
+    if (consumed < count) {
+        /* The tail of this WPTR update is an incomplete packet: proof (for
+         * a live qemu#1 run) that the guest really does bump WPTR
+         * mid-packet -- the precondition the old unconditional-ack bug
+         * needed to corrupt MC_FB_LOCATION/MC_AGP_LOCATION. */
+        static uint64_t ring_deferred_count;
+        static unsigned ring_deferred_budget = 20;
+        ring_deferred_count++;
+        if (ring_deferred_budget) {
+            ring_deferred_budget--;
+            qemu_log("ppc-mac-gpu: PM4 deferred at ring boundary "
+                     "rptr=%u wptr=%u count=%u consumed=%u total=%"PRIu64"\n",
+                     old_rptr, new_wptr, count, consumed,
+                     ring_deferred_count);
+        }
+    }
+
+    s->regs.cp_rb_rptr = (old_rptr + consumed) & ring_mask;
+    s->regs.stall_ring_dwords += consumed;
+    r200_traffic.ring_dwords += consumed;
 }
 
 /* The last command packets pushed in by hand, for the stall report. */
@@ -11205,16 +11396,13 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
          * CP_ME_CNTL bit 28 = ME_HALT: 0 = running, 1 = halted.
          */
         if (!(s->regs.cp_me_cntl & (1 << 28)) && val != old_rptr) {
-            s->regs.stall_ring_dwords += (val >= old_rptr) ? (val - old_rptr) : val;
-            r200_traffic.ring_dwords += (val >= old_rptr) ? (val - old_rptr)
-                                                          : val;
             ppc_mac_gpu_process_ring_buffer(s, old_rptr, val);
         }
 
-        /* Everything is carried out here, so the ring is empty again --
-         * in the card's own register and in the copy the driver may be
-         * reading from memory instead. */
-        s->regs.cp_rb_rptr = val;
+        /* cp_rb_rptr was already advanced, by exactly what was consumed in
+         * complete packets, inside ppc_mac_gpu_process_ring_buffer -- an
+         * incomplete trailing packet is left in guest ring memory rather
+         * than acknowledged (qemu#1). */
         ppc_mac_gpu_rptr_writeback(s);
         /* Bump CSQ stat counter so the kext's "wait for CSQ change" poll
          * sees a different value after we process commands. */
