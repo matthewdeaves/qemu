@@ -17,6 +17,7 @@ export TMPDIR
 python3 test_cp_reads.py
 python3 test_pm4_ring.py
 python3 test_pm4_ring_flow.py
+python3 test_cp_thread.py
 python3 test_pm4_ib.py
 python3 test_2d_packet_headers.py
 python3 test_texview_bounds.py

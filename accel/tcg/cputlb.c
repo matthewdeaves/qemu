@@ -2495,6 +2495,12 @@ static uint64_t do_st_mmio_leN(CPUState *cpu, CPUTLBEntryFull *full,
     section = io_prepare(&mr_offset, cpu, full, addr, ra);
     mr = section->mr;
 
+    /* qemu#25: a lockless_io region (the GPU's CP_RB_WPTR doorbell) runs
+     * without the BQL, so a guest submission never waits for a render. */
+    if (mr->lockless_io) {
+        return int_st_mmio_leN(cpu, full, val_le, addr, size, mmu_idx,
+                               ra, mr, mr_offset);
+    }
     BQL_LOCK_GUARD();
     return int_st_mmio_leN(cpu, full, val_le, addr, size, mmu_idx,
                            ra, mr, mr_offset);

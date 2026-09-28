@@ -122,7 +122,7 @@ assert 'if (packet_dw > size_dw - i) {' in walker and 'break;' in walker, \
     'update the slice (or this IS the qemu#1 regression)'
 
 start = source.index('/* Bound each process_pm4() pass over ring data')
-end = source.index('/* The last command packets pushed in by hand', start)
+end = source.index('/* qemu#25 ----', start)  # ring code ends here; CP thread follows
 ring = source[start:end]
 assert 's->ring_stage_dw' in ring and 's->ring_stage_len' in ring, \
     'ppc_mac_gpu_process_ring_buffer no longer stages an oversized ' \
@@ -205,9 +205,14 @@ assert 'if (was_halted && !now_halted &&\n' in me_cntl, \
     'CP_ME_CNTL handler no longer unconditionally resumes on the ' \
     'halt->run transition -- update the slice (or this IS the qemu#1 P2 ' \
     'regression)'
-assert 'ppc_mac_gpu_process_ring_buffer(s, old_rptr, s->regs.cp_rb_wptr)' \
-    in me_cntl, \
-    'CP_ME_CNTL resume no longer drains [RPTR, WPTR) -- update the slice'
+# qemu#25: the drain is now a CP kick (a doorbell);
+# cp_run is what calls process_ring_buffer for [RPTR, WPTR).
+assert 'ppc_mac_gpu_cp_kick(s);' in me_cntl, \
+    'CP_ME_CNTL resume no longer kicks the CP -- update the slice'
+cp_run_start = source.index('static void ppc_mac_gpu_cp_run(PPCMacGPUState *s)')
+cp_run = source[cp_run_start:source.index('\n}\n', cp_run_start)]
+assert 'ppc_mac_gpu_process_ring_buffer(s, old_rptr, wptr)' in cp_run, \
+    'cp_run no longer drains [RPTR, WPTR) -- update the slice'
 
 stub = r'''
 #include <assert.h>

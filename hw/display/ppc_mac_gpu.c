@@ -48,6 +48,7 @@
 #include "ui/console.h"
 #include "ui/qemu-pixman.h"
 #include "system/system.h"
+#include "system/runstate.h"
 #include "hw/display/ppc_mac_gpu_vp.h"
 #include "trace.h"
 
@@ -252,6 +253,34 @@ static void blit_region_record(uint32_t src_offset, uint32_t src_pitch,
 static FILE *g_seq_log;
 static uint64_t g_seq;
 static int g_in_pm4;            /* > 0 while executing PM4 packets */
+
+/*
+ * qemu#25: the CP ring runs on its own thread ("ppc-gpu-cp"), so the vCPU
+ * keeps executing guest code while the host renders. The thread takes the
+ * BQL for each run, so all device state stays BQL-serialised exactly as it
+ * was when the vCPU ran the ring inline; what changes is only that a
+ * CP_RB_WPTR doorbell (lock-free, see cp_wptr_ops) returns at once.
+ * Ordering: every other guest access to the card calls cp_sync() first,
+ * which runs any unprocessed ring inline. PPCGPU_CP_SYNC=1 keeps the old
+ * inline behaviour (no thread, no lock-free doorbell). Work is "pending"
+ * only while a doorbell (WPTR write or ME unhalt) has not been run yet, so
+ * RPTR/BASE/CNTL reinit writes never replay old ring contents, and a
+ * deferred incomplete tail (qemu#1) is not re-run until more data arrives.
+ */
+static struct {
+    QemuThread thread;
+    QemuEvent kick;
+    PPCMacGPUState *dev;    /* the one device the worker serves */
+    VMChangeStateEntry *vmstate;
+    bool started;
+    bool stop;
+    bool in_run;            /* BQL-protected: cp_run is executing */
+    uint64_t kicks;         /* atomic: doorbells rung */
+    uint64_t runs;
+    uint64_t catchups;      /* cp_sync had to run the ring on the caller */
+} cp;
+static void ppc_mac_gpu_cp_kick(PPCMacGPUState *s);
+static void ppc_mac_gpu_cp_sync(PPCMacGPUState *s);
 
 static bool r200_direct_enabled(void);
 
@@ -1558,6 +1587,13 @@ static void ppc_mac_gpu_display_update(void *opaque)
                          r200_rate.ops2d / sec, r200_rate.flushes / sec,
                          r200_rate.flush_us / (sec * 1e4),
                          r200_rate.gart_copyouts / sec);
+                if (cp.started) {
+                    qemu_log("ppc-mac-gpu ring: %.0f submits/s, %.0f runs/s, "
+                             "%.0f catch-ups/s\n",
+                             (qatomic_xchg(&cp.kicks, 0)) / sec,
+                             cp.runs / sec, cp.catchups / sec);
+                    cp.runs = cp.catchups = 0;
+                }
             }
             memset(&r200_rate, 0, sizeof(r200_rate));
             r200_rate.since = now;
@@ -9887,6 +9923,125 @@ static void ppc_mac_gpu_process_ring_buffer(PPCMacGPUState *s,
     r200_traffic.ring_dwords += fresh_consumed;
 }
 
+/* qemu#25 ---------------------------------------------------------------- */
+
+/* Work exists while a doorbell has rung that no run has consumed yet. */
+static bool ppc_mac_gpu_cp_pending(PPCMacGPUState *s)
+{
+    return qatomic_read(&s->cp_doorbells) != s->cp_done;
+}
+
+/* BQL held. Run everything the guest has published so far. */
+static void ppc_mac_gpu_cp_run(PPCMacGPUState *s)
+{
+    if (cp.in_run) {
+        return;
+    }
+    cp.in_run = true;
+    while (ppc_mac_gpu_cp_pending(s)) {
+        uint32_t bell = qatomic_read(&s->cp_doorbells);
+        uint32_t wptr = qatomic_read(&s->regs.cp_rb_wptr);
+        uint32_t old_rptr = s->regs.cp_rb_rptr;
+
+        cp.runs++;
+        /* CP_ME_CNTL bit 28 = ME_HALT: 0 = running, 1 = halted. */
+        if (!(s->regs.cp_me_cntl & (1 << 28)) && wptr != old_rptr) {
+            ppc_mac_gpu_process_ring_buffer(s, old_rptr, wptr);
+        }
+        /* cp_rb_rptr advanced by exactly what was consumed in complete
+         * packets (qemu#1); an incomplete tail stays in guest memory. */
+        ppc_mac_gpu_rptr_writeback(s);
+        /* Bump CSQ stat counter so the kext's "wait for CSQ change" poll
+         * sees a different value after we process commands. */
+        s->regs.cp_csq_stat_counter++;
+        s->cp_done = bell;
+    }
+    cp.in_run = false;
+}
+
+static void *ppc_mac_gpu_cp_thread(void *opaque)
+{
+    PPCMacGPUState *s = opaque;
+
+    rcu_register_thread();
+    while (!qatomic_read(&cp.stop)) {
+        qemu_event_wait(&cp.kick);
+        qemu_event_reset(&cp.kick);
+        if (qatomic_read(&cp.stop)) {
+            break;
+        }
+        bql_lock();
+        ppc_mac_gpu_cp_run(s);
+        bql_unlock();
+    }
+    rcu_unregister_thread();
+    return NULL;
+}
+
+/* Doorbell: the guest published ring data (WPTR already stored), or the
+ * microengine was unhalted over a backlog. */
+static void ppc_mac_gpu_cp_kick(PPCMacGPUState *s)
+{
+    qatomic_inc(&s->cp_doorbells);
+    if (cp.started && s == cp.dev) {
+        qatomic_inc(&cp.kicks);
+        qemu_event_set(&cp.kick);
+    } else {
+        ppc_mac_gpu_cp_run(s);      /* inline: BQL held on this path */
+    }
+}
+
+/* BQL held. Guest access that must observe the effects of all earlier
+ * submissions: catch the ring up on the calling thread. */
+static void ppc_mac_gpu_cp_sync(PPCMacGPUState *s)
+{
+    if (cp.started && s == cp.dev && !cp.in_run && ppc_mac_gpu_cp_pending(s)) {
+        cp.catchups++;
+        ppc_mac_gpu_cp_run(s);
+    }
+}
+
+/* Migration/savevm capture RAM before device state: drain when the VM stops. */
+static void ppc_mac_gpu_cp_vm_state(void *opaque, bool running, RunState state)
+{
+    if (!running) {
+        ppc_mac_gpu_cp_sync(opaque);
+    }
+}
+
+/* Returns true when this device is now served by the CP thread. */
+static bool ppc_mac_gpu_cp_start(PPCMacGPUState *s)
+{
+    if (cp.started || getenv("PPCGPU_CP_SYNC")) {
+        return false;
+    }
+    qemu_event_init(&cp.kick, false);
+    cp.stop = false;
+    cp.dev = s;
+    cp.vmstate = qemu_add_vm_change_state_handler(ppc_mac_gpu_cp_vm_state, s);
+    qemu_thread_create(&cp.thread, "ppc-gpu-cp", ppc_mac_gpu_cp_thread, s,
+                       QEMU_THREAD_JOINABLE);
+    cp.started = true;
+    return true;
+}
+
+static void ppc_mac_gpu_cp_stop(PPCMacGPUState *s)
+{
+    if (!cp.started || s != cp.dev) {
+        return;
+    }
+    qemu_del_vm_change_state_handler(cp.vmstate);
+    qatomic_set(&cp.stop, true);
+    qemu_event_set(&cp.kick);
+    /* The thread may be blocked in bql_lock(): let it in before joining. */
+    bql_unlock();
+    qemu_thread_join(&cp.thread);
+    bql_lock();
+    cp.started = false;
+    cp.dev = NULL;
+    qemu_event_destroy(&cp.kick);
+}
+
 /* The last command packets pushed in by hand, for the stall report. */
 static struct { uint32_t hdr, type, opcode, count; } pm4_recent[32];
 static unsigned pm4_recent_n;
@@ -11638,31 +11793,16 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         ppc_mac_gpu_rptr_writeback(s);
         gpu_debug_log("CP_RING RPTR <- %u", (uint32_t)val);
         break;
-    case R200_CP_RB_WPTR: {
-        uint32_t old_rptr = s->regs.cp_rb_rptr;
+    case R200_CP_RB_WPTR:
         gpu_debug_log("CP_RING WPTR <- %u (prev=%u, delta=%d)",
                       (uint32_t)val, s->regs.cp_rb_wptr,
                       (int)val - (int)s->regs.cp_rb_wptr);
-        s->regs.cp_rb_wptr = val;
-
-        /*
-         * Process ring buffer commands if the microengine is started.
-         * CP_ME_CNTL bit 28 = ME_HALT: 0 = running, 1 = halted.
-         */
-        if (!(s->regs.cp_me_cntl & (1 << 28)) && val != old_rptr) {
-            ppc_mac_gpu_process_ring_buffer(s, old_rptr, val);
-        }
-
-        /* cp_rb_rptr was already advanced, by exactly what was consumed in
-         * complete packets, inside ppc_mac_gpu_process_ring_buffer -- an
-         * incomplete trailing packet is left in guest ring memory rather
-         * than acknowledged (qemu#1). */
-        ppc_mac_gpu_rptr_writeback(s);
-        /* Bump CSQ stat counter so the kext's "wait for CSQ change" poll
-         * sees a different value after we process commands. */
-        s->regs.cp_csq_stat_counter++;
+        qatomic_set(&s->regs.cp_rb_wptr, val);
+        /* Dispatch [RPTR, WPTR) on the CP thread (or inline under
+         * PPCGPU_CP_SYNC). While ME_HALT is set the run leaves the backlog
+         * alone; the ME_CNTL unhalt below resumes it (qemu#1). */
+        ppc_mac_gpu_cp_kick(s);
         break;
-    }
     case R200_CP_ME_CNTL: {
         /*
          * qemu#1: WPTR writes made while ME_HALT was set are stored
@@ -11681,10 +11821,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         gpu_debug_log("CP_SETUP ME_CNTL=0x%08x (ME_start=%d)", (uint32_t)val, !((uint32_t)val & 0x10000000));
         if (was_halted && !now_halted &&
             s->regs.cp_rb_wptr != s->regs.cp_rb_rptr) {
-            uint32_t old_rptr = s->regs.cp_rb_rptr;
-            ppc_mac_gpu_process_ring_buffer(s, old_rptr, s->regs.cp_rb_wptr);
-            ppc_mac_gpu_rptr_writeback(s);
-            s->regs.cp_csq_stat_counter++;
+            ppc_mac_gpu_cp_kick(s);
         }
         break;
     }
@@ -12089,9 +12226,64 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     }
 }
 
+/*
+ * qemu#25: guest access to the register file first catches the ring up
+ * (ppc_mac_gpu_cp_sync), so it observes everything submitted before it.
+ * CP_RB_RPTR/WPTR are exempt so a guest polling the ring for space or
+ * completion does not run the ring itself. Type-0 ring packets call the
+ * inner handlers directly and never come through here.
+ */
+static uint64_t ppc_mac_gpu_mmio_read_guest(void *opaque, hwaddr addr,
+                                            unsigned size)
+{
+    PPCMacGPUState *s = opaque;
+
+    if ((addr & ~3ull) != R200_CP_RB_RPTR &&
+        (addr & ~3ull) != R200_CP_RB_WPTR) {
+        ppc_mac_gpu_cp_sync(s);
+    }
+    return ppc_mac_gpu_mmio_read(opaque, addr, size);
+}
+
+static void ppc_mac_gpu_mmio_write_guest(void *opaque, hwaddr addr,
+                                         uint64_t val, unsigned size)
+{
+    PPCMacGPUState *s = opaque;
+
+    if ((addr & ~3ull) != R200_CP_RB_WPTR) {
+        ppc_mac_gpu_cp_sync(s);
+    }
+    ppc_mac_gpu_mmio_write(opaque, addr, val, size);
+}
+
+/* Lock-free doorbell: no BQL, store WPTR and wake the CP thread. */
+static uint64_t cp_wptr_read(void *opaque, hwaddr addr, unsigned size)
+{
+    PPCMacGPUState *s = opaque;
+
+    return qatomic_read(&s->regs.cp_rb_wptr);
+}
+
+static void cp_wptr_write(void *opaque, hwaddr addr, uint64_t val,
+                          unsigned size)
+{
+    PPCMacGPUState *s = opaque;
+
+    qatomic_set(&s->regs.cp_rb_wptr, (uint32_t)val);
+    ppc_mac_gpu_cp_kick(s);
+}
+
+static const MemoryRegionOps cp_wptr_ops = {
+    .read = cp_wptr_read,
+    .write = cp_wptr_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 4, .max_access_size = 4 },
+    .impl = { .min_access_size = 4, .max_access_size = 4 },
+};
+
 static const MemoryRegionOps ppc_mac_gpu_mmio_ops = {
-    .read = ppc_mac_gpu_mmio_read,
-    .write = ppc_mac_gpu_mmio_write,
+    .read = ppc_mac_gpu_mmio_read_guest,
+    .write = ppc_mac_gpu_mmio_write_guest,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = {
         .min_access_size = 1,
@@ -12163,6 +12355,8 @@ static void r300_ap1_note(PPCMacGPUState *s, hwaddr off, bool wr, unsigned m)
 static uint64_t r300_ap1_read(void *opaque, hwaddr addr, unsigned size)
 {
     PPCMacGPUState *s = opaque;
+
+    ppc_mac_gpu_cp_sync(s); /* qemu#25 */
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
     hwaddr base = addr & ~3ull;
     uint8_t b[4];
@@ -12187,6 +12381,8 @@ static void r300_ap1_write(void *opaque, hwaddr addr, uint64_t val,
                            unsigned size)
 {
     PPCMacGPUState *s = opaque;
+
+    ppc_mac_gpu_cp_sync(s); /* qemu#25 */
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
     hwaddr base = addr & ~3ull;
     uint8_t b[4];
@@ -12214,6 +12410,8 @@ static void r300_ap1_write(void *opaque, hwaddr addr, uint64_t val,
 static uint64_t r300_watch_read(void *opaque, hwaddr addr, unsigned size)
 {
     PPCMacGPUState *s = opaque;
+
+    ppc_mac_gpu_cp_sync(s); /* qemu#25 */
     uint8_t *p = (uint8_t *)memory_region_get_ram_ptr(&s->vram) +
                  s->r300_watch_base + addr;
     uint64_t v = 0;
@@ -12233,6 +12431,8 @@ static void r300_watch_write(void *opaque, hwaddr addr, uint64_t val,
                              unsigned size)
 {
     PPCMacGPUState *s = opaque;
+
+    ppc_mac_gpu_cp_sync(s); /* qemu#25 */
     uint8_t *p = (uint8_t *)memory_region_get_ram_ptr(&s->vram) +
                  s->r300_watch_base + addr;
 
@@ -12407,7 +12607,9 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
     PPCMacGPUState *s = PPC_MAC_GPU(dev);
 
     s->reset_gen++;
+    qatomic_set(&s->regs.cp_rb_wptr, 0);
     memset(&s->regs, 0, sizeof(s->regs));
+    s->cp_done = qatomic_read(&s->cp_doorbells); /* qemu#25: drop unrun work */
     s->hwc_w = s->hwc_h = s->hwc_idx = 0;
     s->ring_stage_len = 0; /* qemu#1: don't resume a stale partial packet */
     s->regs.regs_3d[R200_3D_IDX(0x3230)] = 0xFFFFFFFFu;  /* DEPTHCLEARVALUE */
@@ -12914,6 +13116,15 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
                  (1 << 9)   |      /* D1 supported */
                  (1 << 10));       /* D2 supported */
 
+    if (ppc_mac_gpu_cp_start(s)) {
+        /* qemu#25: lock-free CP_RB_WPTR doorbell over the register BAR */
+        memory_region_init_io(&s->cp_wptr_mr, obj, &cp_wptr_ops, s,
+                              "ppc-mac-gpu-cp-wptr", 4);
+        memory_region_enable_lockless_io(&s->cp_wptr_mr);
+        memory_region_add_subregion_overlap(&s->mmio, R200_CP_RB_WPTR,
+                                            &s->cp_wptr_mr, 1);
+    }
+
     trace_ppc_mac_gpu_realize(s->vram_size_mb, s->vram_size);
 }
 
@@ -12941,6 +13152,7 @@ static void ppc_mac_gpu_exit(PCIDevice *dev)
     PPCMacGPUState *s = PPC_MAC_GPU(dev);
 
     timer_del(&s->vblank_timer);
+    ppc_mac_gpu_cp_stop(s);
     g_free(s->shadow_buf);
     s->shadow_buf = NULL;
     g_free(s->draw_verts);
@@ -13056,6 +13268,14 @@ static char *ppc_mac_gpu_get_perf(Object *obj, Error **errp)
  * buffers are refilled by the driver.
  * ======================================================================== */
 
+static int ppc_mac_gpu_pre_save(void *opaque)
+{
+    /* qemu#25: nothing may be in flight on the CP thread's account when the
+     * registers are captured. */
+    ppc_mac_gpu_cp_sync(opaque);
+    return 0;
+}
+
 static int ppc_mac_gpu_post_load(void *opaque, int version_id)
 {
     PPCMacGPUState *s = opaque;
@@ -13144,6 +13364,7 @@ static const VMStateDescription vmstate_ppc_mac_gpu = {
     .name = "ppc-mac-gpu",
     .version_id = 1,
     .minimum_version_id = 1,
+    .pre_save = ppc_mac_gpu_pre_save,
     .post_load = ppc_mac_gpu_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_PCI_DEVICE(pci, PPCMacGPUState),
