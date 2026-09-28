@@ -7878,6 +7878,141 @@ static FILE *r300_ringdump(void)
 static const char *cp_submission;
 
 /*
+ * CNTL_BITBLT_MULTI (qemu#20): the header is 1 to 6 dwords depending on
+ * which GMC bits are set, but body_dw is the packet's OWN declared length
+ * -- a guest can set GMC bits implying a 6-dword header while declaring
+ * body_dw as low as 4, which used to read d[4]/d[5] before any check of
+ * body_dw ran (up to 2 dwords past what the walker's own packet_dw check
+ * confirmed fits in the buffer). Each conditional read is now gated on
+ * its own index fitting within body_dw, matching the "confirm before you
+ * touch it" shape of the body_dw < hdr_dw + 3 triplet check that already
+ * followed it. Pure (no I/O, no device-state mutation) so it can be
+ * extracted and tested on its own (tests/r300/test_2d_packet_headers.py),
+ * the same technique qemu#1 used for ppc_mac_gpu_process_pm4.
+ *
+ * Precondition: body_dw >= 1 (d[0], the GMC word, is read unconditionally).
+ * The only caller enforces this via its own body_dw >= 4 dispatch guard.
+ */
+static bool ppc_mac_gpu_bbm_header(const uint32_t *d, uint32_t body_dw,
+                                    uint32_t default_po, uint32_t *hdr_dw_out,
+                                    uint32_t *src_po_out, uint32_t *dst_po_out,
+                                    uint32_t *clip_tl_out, uint32_t *clip_br_out)
+{
+    uint32_t gmc = d[0];
+    uint32_t hdr_dw = 1;   /* d[0] = GMC */
+    uint32_t src_po = default_po, dst_po = default_po;
+    uint32_t clip_tl = 0, clip_br = 0x3FFF3FFF;
+
+    if (gmc & R200_GMC_SRC_PITCH_OFFSET_CNTL) {
+        if (hdr_dw >= body_dw) {
+            return false;
+        }
+        src_po = d[hdr_dw++];
+    }
+    if (gmc & R200_GMC_DST_PITCH_OFFSET_CNTL) {
+        if (hdr_dw >= body_dw) {
+            return false;
+        }
+        dst_po = d[hdr_dw++];
+    }
+    if (gmc & R200_GMC_SRC_CLIPPING) {
+        hdr_dw++;                   /* SRC_SC_BOTTOM_RIGHT, not read */
+    }
+    if (gmc & R200_GMC_DST_CLIPPING) {
+        if (hdr_dw + 2 > body_dw) {
+            return false;
+        }
+        clip_tl = d[hdr_dw++];
+        clip_br = d[hdr_dw++];
+    }
+
+    *hdr_dw_out = hdr_dw;
+    *src_po_out = src_po;
+    *dst_po_out = dst_po;
+    *clip_tl_out = clip_tl;
+    *clip_br_out = clip_br;
+    return true;
+}
+
+/*
+ * CNTL_PAINT_MULTI (qemu#20): same shape of bug as BITBLT_MULTI above, but
+ * worse in effect -- the unguarded brush-colour read could push idx past
+ * body_dw, and the caller's num_fills = (body_dw - idx) / 2 then underflows
+ * to a huge unsigned value, turning the fill loop into an effectively
+ * unbounded OOB read (not just one or two stray dwords). Every conditional
+ * read is gated the same way as ppc_mac_gpu_bbm_header, so idx can never
+ * exceed body_dw on return.
+ *
+ * Precondition: body_dw >= 1 (same as ppc_mac_gpu_bbm_header). The only
+ * caller enforces this via its own body_dw >= 3 dispatch guard. The
+ * source-clip word (GMC bit 2) is skipped, not read, so it does not need
+ * its own bounds check -- but a packet that sets that bit without actually
+ * having the word is (silently) treated as if it did; that word is never
+ * used for anything, so no value ever comes from beyond body_dw.
+ */
+static bool ppc_mac_gpu_pm_header(const uint32_t *d, uint32_t body_dw,
+                                   uint32_t default_po, uint32_t default_color,
+                                   uint32_t *idx_out, uint32_t *offset_out,
+                                   uint32_t *pitch_out, uint32_t *po_out,
+                                   uint32_t *clip_x0_out, uint32_t *clip_y0_out,
+                                   uint32_t *clip_x1_out, uint32_t *clip_y1_out,
+                                   uint32_t *color_out)
+{
+    uint32_t gmc = d[0];
+    bool has_po = (gmc >> 1) & 1;
+    uint32_t idx = 1;
+    uint32_t po, offset, pitch;
+
+    if (has_po) {
+        if (idx >= body_dw) {
+            return false;
+        }
+        po = d[idx++];
+    } else {
+        po = default_po;
+    }
+    offset = (po & 0x3FFFFF) << 10;
+    pitch  = (po & 0x3FC00000) >> 16;
+
+    uint32_t clip_x0 = 0, clip_y0 = 0, clip_x1 = 0x3FFF, clip_y1 = 0x3FFF;
+    if (gmc & R200_GMC_SRC_CLIPPING) {
+        idx++;                      /* SRC_SC_BOTTOM_RIGHT, not read */
+    }
+    if (gmc & R200_GMC_DST_CLIPPING) {
+        if (idx + 2 > body_dw) {
+            return false;
+        }
+        uint32_t tl = d[idx++], br = d[idx++];
+        clip_x0 = tl & 0x3FFF;
+        clip_y0 = (tl >> 16) & 0x3FFF;
+        clip_x1 = br & 0x3FFF;          /* exclusive */
+        clip_y1 = (br >> 16) & 0x3FFF;
+    }
+
+    uint32_t brush_type = (gmc >> 4) & 0xF;
+    uint32_t color;
+    if (brush_type == 0xD) {
+        if (idx >= body_dw) {
+            return false;
+        }
+        color = d[idx++];
+    } else {
+        color = default_color;
+    }
+
+    *idx_out = idx;
+    *offset_out = offset;
+    *pitch_out = pitch;
+    *po_out = has_po ? po : 0;
+    *clip_x0_out = clip_x0;
+    *clip_y0_out = clip_y0;
+    *clip_x1_out = clip_x1;
+    *clip_y1_out = clip_y1;
+    *color_out = color;
+    return true;
+}
+
+/*
  * Total dwords (header + body) a PM4 packet occupies in the stream, purely
  * from its header -- shared by every caller that must know whether a
  * packet fits before touching it (qemu#1).
@@ -8100,8 +8235,7 @@ static uint32_t ppc_mac_gpu_pm4_dispatch(PPCMacGPUState *s,
                 uint32_t gmc = d[0];
                 uint32_t rop3 = (gmc >> 16) & 0xFF;
 
-                uint32_t hdr_dw = 1;   /* d[0] = GMC */
-                uint32_t src_po, dst_po;
+                uint32_t hdr_dw, src_po, dst_po, bbm_clip_tl, bbm_clip_br;
 
                 /*
                  * A clear control bit does NOT mean "use the SRC_/DST_
@@ -8111,25 +8245,19 @@ static uint32_t ppc_mac_gpu_pm4_dispatch(PPCMacGPUState *s,
                  * leave DST_PITCH_OFFSET equal to the default — but that
                  * first save lands at a stale pitch and the drag then
                  * copies the damage forward every frame.
+                 *
+                 * body_dw is the packet's OWN declared length, not the
+                 * header's -- a header implied by the GMC bits (up to 6
+                 * dwords) can be longer than body_dw says, so every
+                 * conditional read here is bounds-checked (qemu#20)
+                 * before it happens, not after.
                  */
-                if (gmc & R200_GMC_SRC_PITCH_OFFSET_CNTL) {
-                    src_po = d[hdr_dw++];
-                } else {
-                    src_po = s->regs.default_pitch_offset;
-                }
-                if (gmc & R200_GMC_DST_PITCH_OFFSET_CNTL) {
-                    dst_po = d[hdr_dw++];
-                } else {
-                    dst_po = s->regs.default_pitch_offset;
-                }
-                /* Packet clip fields (GMC bits 2/3) precede the triplets. */
-                uint32_t bbm_clip_tl = 0, bbm_clip_br = 0x3FFF3FFF;
-                if (gmc & R200_GMC_SRC_CLIPPING) {
-                    hdr_dw++;                   /* SRC_SC_BOTTOM_RIGHT */
-                }
-                if (gmc & R200_GMC_DST_CLIPPING) {
-                    bbm_clip_tl = d[hdr_dw++];
-                    bbm_clip_br = d[hdr_dw++];
+                if (!ppc_mac_gpu_bbm_header(d, body_dw,
+                                             s->regs.default_pitch_offset,
+                                             &hdr_dw, &src_po, &dst_po,
+                                             &bbm_clip_tl, &bbm_clip_br)) {
+                    i += body_adv;
+                    return i;
                 }
 
                 if (hdr_dw <= ARRAY_SIZE(bbm_hdr)) {
@@ -8659,47 +8787,33 @@ static uint32_t ppc_mac_gpu_pm4_dispatch(PPCMacGPUState *s,
                 uint32_t gmc = d[0];
                 uint32_t rop3 = (gmc >> 16) & 0xFF;
                 bool has_po = (gmc >> 1) & 1;
+                uint32_t brush_type = (gmc >> 4) & 0xF;   /* 0xD = solid color */
                 uint32_t bpp = gmc_dst_bpp(gmc);
-                uint32_t idx = 1;
-
-                uint32_t offset, pitch;
-                if (has_po) {
-                    uint32_t po = d[idx++];
-                    offset = (po & 0x3FFFFF) << 10;
-                    pitch  = (po & 0x3FC00000) >> 16;
-                    /* MC-style: register tiled surface if macro_tile=1 */
-                    if ((po >> 30) & 1) {
-                        mc_register_tiled_surface(s, offset, pitch, "PAINT_PO");
-                    }
-                } else {
-                    /* GMC_DST_PITCH_OFFSET_CNTL clear: DEFAULT_PITCH_OFFSET,
-                     * not the separate DST_OFFSET/DST_PITCH registers. */
-                    uint32_t po = s->regs.default_pitch_offset;
-                    offset = (po & 0x3FFFFF) << 10;
-                    pitch  = (po & 0x3FC00000) >> 16;
-                }
-
-                /* Packet clip fields (GMC bits 2/3) come before the brush. */
-                uint32_t pm_clip_x0 = 0, pm_clip_y0 = 0;
-                uint32_t pm_clip_x1 = 0x3FFF, pm_clip_y1 = 0x3FFF;
-                if (gmc & R200_GMC_SRC_CLIPPING) {
-                    idx++;                      /* SRC_SC_BOTTOM_RIGHT */
-                }
-                if ((gmc & R200_GMC_DST_CLIPPING) && idx + 2 <= body_dw) {
-                    uint32_t tl = d[idx++], br = d[idx++];
-                    pm_clip_x0 = tl & 0x3FFF;
-                    pm_clip_y0 = (tl >> 16) & 0x3FFF;
-                    pm_clip_x1 = br & 0x3FFF;          /* exclusive */
-                    pm_clip_y1 = (br >> 16) & 0x3FFF;
-                }
-
-                /* Brush type in bits 7:4 — 0xD = solid color */
-                uint32_t brush_type = (gmc >> 4) & 0xF;
+                uint32_t idx, offset, pitch, po;
+                uint32_t pm_clip_x0, pm_clip_y0, pm_clip_x1, pm_clip_y1;
                 uint32_t color;
-                if (brush_type == 0xD) {
-                    color = d[idx++];
-                } else {
-                    color = s->regs.dp_brush_frgd_clr;
+
+                /*
+                 * body_dw is the packet's OWN declared length; the brush
+                 * colour read below is what used to run unbounded (qemu#20)
+                 * -- an idx that overran body_dw made num_fills = (body_dw -
+                 * idx) / 2 underflow into a huge unsigned count, turning the
+                 * fill loop after this block into an effectively unbounded
+                 * OOB read. Every conditional read is now bounds-checked
+                 * before it happens.
+                 */
+                if (!ppc_mac_gpu_pm_header(d, body_dw,
+                                            s->regs.default_pitch_offset,
+                                            s->regs.dp_brush_frgd_clr,
+                                            &idx, &offset, &pitch, &po,
+                                            &pm_clip_x0, &pm_clip_y0,
+                                            &pm_clip_x1, &pm_clip_y1, &color)) {
+                    i += body_adv;
+                    return i;
+                }
+                /* MC-style: register tiled surface if macro_tile=1 */
+                if (has_po && ((po >> 30) & 1)) {
+                    mc_register_tiled_surface(s, offset, pitch, "PAINT_PO");
                 }
 
                 if (pitch == 0) {
