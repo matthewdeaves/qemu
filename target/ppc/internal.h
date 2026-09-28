@@ -331,4 +331,7 @@ static inline int ger_pack_masks(int pmsk, int ymsk, int xmsk)
 TCGTBCPUState ppc_get_tb_cpu_state(CPUState *cs);
 #endif
 
+/* PPC_VMX_HOST=0 turns the host-NEON AltiVec paths off (int_helper.c). */
+extern bool ppc_vmx_host_ops;
+
 #endif /* PPC_INTERNAL_H */

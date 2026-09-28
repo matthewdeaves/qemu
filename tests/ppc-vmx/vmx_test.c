@@ -12,6 +12,11 @@
  *   +12 failures per op (NOPS words)
  *   +0x100 first MAXLOG failures: op, iteration, a, b, c, got, expected
  *   +0x800 benchmark: timebase ticks per op for BENCH_ITERS iterations
+ *   +0x1000 DIFF_OPS * 2 hashes (NJ=0, NJ=1) of every float op's exact
+ *           output words and VSCR over random and directed inputs, NaN
+ *           payloads included.  run.py --diff runs the image with the host
+ *           paths on and off (PPC_VMX_HOST) and requires identical hashes:
+ *           the old helpers are the oracle.
  *
  * Built by run.py with clang --target=powerpc-unknown-none -maltivec.
  */
@@ -36,6 +41,8 @@ typedef union {
 } V;
 
 #define FIRST_FP_OP OP_VADDFP
+/* vctsxs/vctuxs (the last two ops) produce integers, not floats. */
+#define FP_RESULT(op) ((op) >= FIRST_FP_OP && (op) < OP_VCTSXS)
 
 enum {
     OP_VPERM, OP_VPERM_DA, OP_VPERM_DC, OP_VPERM_AA, OP_VSLDOI, OP_VSLDOI_DB,
@@ -530,6 +537,146 @@ static void log_vec(volatile uint32_t *p, V v)
     }
 }
 
+/* ---- Exact old-vs-new differential: hashes of every output bit. ---- */
+
+enum { D_ADD, D_SUB, D_MAX, D_MIN, D_MADD, D_NMSUB, D_REFP, D_RSQRTE,
+       D_CFSX, D_CFUX, D_CTSXS, D_CTUXS, DIFF_OPS };
+#define DIFF_ITERS 6000
+
+static const uint32_t directed[] = {
+    0x00000000, 0x80000000, 0x3f800000, 0xbf800000, 0x00800000, 0x80800000,
+    0x007fffff, 0x807fffff, 0x00000001, 0x80000001, 0x7f7fffff, 0xff7fffff,
+    0x7f800000, 0xff800000, 0x7fc00000, 0x7f800001, 0xffc12345, 0x7fa00000,
+    0x3f7fffff, 0x3f800001, 0x4f000000, 0x4effffff, 0x4f000001, 0xcf000000,
+    0xcf000001, 0x4f800000, 0x4f7fffff, 0xcf800000, 0x33800000, 0x3effffff,
+    0x00ffffff, 0x01000000, 0x40000000, 0x3f000000, 0x7e800000, 0x7f000000,
+    0x00c00000, 0x00800001, 0x00bfffff, 0x3fc00000,
+};
+#define NDIRECTED (sizeof(directed) / sizeof(directed[0]))
+
+static V dvec(uint32_t *s)
+{
+    V r = rand_fvec(s);
+    int i;
+
+    for (i = 0; i < 4; i++) {
+        uint32_t x = rnd(s);
+        if ((x & 3) == 0) {
+            r.w[i] = directed[(x >> 8) % NDIRECTED];
+        }
+    }
+    return r;
+}
+
+static void set_vscr(uint32_t nj)
+{
+    V z;
+    memset(&z, 0, sizeof(z));
+    z.w[3] = nj << 16;
+    asm volatile("mtvscr %0" : : "v"(z.v));
+}
+
+static uint32_t vscr_word(void)
+{
+    V r;
+    asm volatile("mfvscr %0" : "=v"(r.v));
+    return r.w[3];
+}
+
+#define UIM32(X) X(0) X(1) X(2) X(3) X(4) X(5) X(6) X(7) X(8) X(9) X(10)   \
+    X(11) X(12) X(13) X(14) X(15) X(16) X(17) X(18) X(19) X(20) X(21)     \
+    X(22) X(23) X(24) X(25) X(26) X(27) X(28) X(29) X(30) X(31)
+
+static V diff_cvt(int op, V b, int uim)
+{
+    V r;
+#define DC(n)                                                               \
+    case n:                                                                 \
+        if (op == D_CFSX) {                                                 \
+            asm volatile("vcfsx %0,%1,%2" : "=v"(r.v) : "v"(b.v), "i"(n));  \
+        } else if (op == D_CFUX) {                                          \
+            asm volatile("vcfux %0,%1,%2" : "=v"(r.v) : "v"(b.v), "i"(n));  \
+        } else if (op == D_CTSXS) {                                         \
+            asm volatile("vctsxs %0,%1,%2" : "=v"(r.v) : "v"(b.v), "i"(n)); \
+        } else {                                                            \
+            asm volatile("vctuxs %0,%1,%2" : "=v"(r.v) : "v"(b.v), "i"(n)); \
+        }                                                                   \
+        break;
+    switch (uim) {
+        UIM32(DC)
+    }
+#undef DC
+    return r;
+}
+
+static uint32_t fnv(uint32_t h, uint32_t w)
+{
+    return (h ^ w) * 16777619u;
+}
+
+static void diff_phase(uint32_t *seed)
+{
+    int nj, op, it, i;
+
+    for (nj = 0; nj < 2; nj++) {
+        for (op = 0; op < DIFF_OPS; op++) {
+            uint32_t h = 2166136261u;
+
+            for (it = 0; it < DIFF_ITERS; it++) {
+                V a = dvec(seed), b = dvec(seed), c = dvec(seed), r;
+
+                /* Integer inputs for the int-to-float conversions. */
+                if (op == D_CFSX || op == D_CFUX) {
+                    b = rand_vec(seed);
+                    if (it & 1) {
+                        b = rand_fvec(seed);
+                    }
+                }
+                if (it % 97 == 0) {     /* NJ rounding-edge FMA operands */
+                    a.w[0] = a.w[1] = 0x00800000;
+                    b.w[0] = b.w[1] = 0x3f7fffff;   /* a * b + c */
+                    c.w[0] = c.w[1] = 0;
+                }
+                set_vscr(nj);
+                switch (op) {
+                case D_ADD:
+                    ASM3("vaddfp", r, a, b);
+                    break;
+                case D_SUB:
+                    ASM3("vsubfp", r, a, b);
+                    break;
+                case D_MAX:
+                    ASM3("vmaxfp", r, a, b);
+                    break;
+                case D_MIN:
+                    ASM3("vminfp", r, a, b);
+                    break;
+                case D_MADD:
+                    ASM4("vmaddfp", r, a, b, c);
+                    break;
+                case D_NMSUB:
+                    ASM4("vnmsubfp", r, a, b, c);
+                    break;
+                case D_REFP:
+                    ASM2("vrefp", r, b);
+                    break;
+                case D_RSQRTE:
+                    ASM2("vrsqrtefp", r, b);
+                    break;
+                default:
+                    r = diff_cvt(op, b, it & 31);
+                    break;
+                }
+                for (i = 0; i < 4; i++) {
+                    h = fnv(h, r.w[i]);
+                }
+                h = fnv(h, vscr_word());
+            }
+            res[0x400 + nj * DIFF_OPS + op] = h;
+        }
+    }
+}
+
 /* Dependent chains of the hot ops, for timing against the helper path. */
 static void bench(void)
 {
@@ -592,7 +739,7 @@ int main(void)
     uint32_t checks = 0, fails = 0, logged = 0;
     int op, it, i;
 
-    for (i = 0; i < 0x300; i++) {
+    for (i = 0; i < 0x440; i++) {
         res[i] = 0;
     }
     for (op = 0; op < NOPS; op++) {
@@ -608,7 +755,7 @@ int main(void)
             }
             run_op(op, a, b, c, it & 15, &got, &exp, &gs, &es);
             for (i = 0; i < 4; i++) {
-                if (op >= FIRST_FP_OP && is_nan(exp.w[i])) {
+                if (FP_RESULT(op) && is_nan(exp.w[i])) {
                     /* NaN payloads are softfloat's either way. */
                     bad |= !is_nan(got.w[i]);
                 } else {
@@ -636,6 +783,7 @@ int main(void)
     }
     res[1] = checks;
     res[2] = fails;
+    diff_phase(&seed);
     bench();
     res[0] = 0x564d5854; /* 'VMXT' */
     return 0;

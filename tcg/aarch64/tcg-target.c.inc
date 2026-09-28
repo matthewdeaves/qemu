@@ -632,8 +632,8 @@ typedef enum {
     Iqrrr_e_USHL      = 0x2e204400,
 
     /* AdvSIMD table lookup, one table register (len = 0).  */
-    I3616_TBL       = 0x0e000000,
-    I3616_TBX       = 0x0e001000,
+    Iqrrr_e_TBL      = 0x0e000000,
+    Iqrrr_e_TBX      = 0x0e001000,
 
     /* AdvSIMD two-reg misc.  */
     Iqrr_e_CMGT0      = 0x0e208800,
@@ -3253,10 +3253,10 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
 
             tcg_debug_assert(is_q);
             tcg_out_dupi_vec(s, TCG_TYPE_V128, MO_8, TCG_VEC_TMP0, 16);
-            tcg_out_insn(s, 3616, EOR, 1, 0, TCG_VEC_TMP0,
+            tcg_out_insn(s, qrrr_e, EOR, 1, 0, TCG_VEC_TMP0,
                          args[3], TCG_VEC_TMP0);
-            tcg_out_insn(s, 3616, TBL, 1, 0, d, a2, TCG_VEC_TMP0);
-            tcg_out_insn(s, 3616, TBX, 1, 0, d, a1, args[3]);
+            tcg_out_insn(s, qrrr_e, TBL, 1, 0, d, a2, TCG_VEC_TMP0);
+            tcg_out_insn(s, qrrr_e, TBX, 1, 0, d, a1, args[3]);
             if (d != a0) {
                 tcg_out_mov(s, type, a0, d);
             }

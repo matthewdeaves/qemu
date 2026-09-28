@@ -505,6 +505,22 @@ void helper_VPRTYBQ(ppc_avr_t *r, ppc_avr_t *b, uint32_t v)
 }
 
 /*
+ * PPC_VMX_HOST=0 in the environment switches the host-NEON AltiVec paths
+ * (these float fast paths and the tbl_vec translations in vmx-impl.c.inc)
+ * back to the softfloat/out-of-line helpers.  Read once at startup.
+ */
+bool ppc_vmx_host_ops = true;
+
+static void __attribute__((constructor)) ppc_vmx_host_ops_init(void)
+{
+    const char *e = getenv("PPC_VMX_HOST");
+
+    if (e && !strcmp(e, "0")) {
+        ppc_vmx_host_ops = false;
+    }
+}
+
+/*
  * Host-FPU fast paths for the AltiVec float ops.
  *
  * AltiVec float arithmetic always rounds to nearest and raises no
@@ -537,7 +553,16 @@ static inline float32x4_t vfp_ld(ppc_avr_t *v)
 
 static inline bool vfp_st_checked(ppc_avr_t *r, float32x4_t x)
 {
-    if (!vfp_all_zon(x)) {
+    uint32x4_t mag = vandq_u32(vreinterpretq_u32_f32(x),
+                               vdupq_n_u32(0x7fffffff));
+
+    /*
+     * A tiny exact result that rounds up to the smallest normal is still
+     * "tiny" to softfloat (flushed when VSCR[NJ] is set), so leave it to
+     * softfloat too.
+     */
+    if (!vfp_all_zon(x) ||
+        vmaxvq_u32(vceqq_u32(mag, vdupq_n_u32(0x00800000))) != 0) {
         return false;
     }
     vst1q_u32(r->u32, vreinterpretq_u32_f32(x));
@@ -553,7 +578,7 @@ static inline bool vfp_fast(int op, ppc_avr_t *r, ppc_avr_t *a,
 {
     float32x4_t fa = vfp_ld(a), fb, fc, x;
 
-    if (!vfp_all_zon(fa)) {
+    if (!ppc_vmx_host_ops || !vfp_all_zon(fa)) {
         return false;
     }
     switch (op) {
@@ -598,9 +623,15 @@ static inline bool vfp_fast(int op, ppc_avr_t *r, ppc_avr_t *a,
 static inline bool vfp_fast_cf(ppc_avr_t *r, ppc_avr_t *b, uint32_t uim,
                                bool sign)
 {
-    float32x4_t x = sign ? vcvtq_f32_s32(vld1q_s32(b->s32))
+    float32x4_t x;
+    float32x4_t scale;
+
+    if (!ppc_vmx_host_ops) {
+        return false;
+    }
+    x = sign ? vcvtq_f32_s32(vld1q_s32(b->s32))
                          : vcvtq_f32_u32(vld1q_u32(b->u32));
-    float32x4_t scale = vreinterpretq_f32_u32(vdupq_n_u32((127 - uim) << 23));
+    scale = vreinterpretq_f32_u32(vdupq_n_u32((127 - uim) << 23));
 
     return vfp_st_checked(r, vmulq_f32(x, scale));
 }
@@ -616,7 +647,7 @@ static inline bool vfp_fast_ct(ppc_avr_t *r, ppc_avr_t *b, uint32_t uim,
     uint32x4_t res;
     uint64x2_t back_lo, back_hi;
 
-    if (!vfp_all_zon(fb)) {
+    if (!ppc_vmx_host_ops || !vfp_all_zon(fb)) {
         return false;
     }
     /* Exact in double; the conversion truncates and saturates to 64 bits. */

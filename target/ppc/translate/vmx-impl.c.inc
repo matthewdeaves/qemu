@@ -51,7 +51,8 @@ static inline void set_avr_full(int regno, TCGv_i128 src)
 #if !HOST_BIG_ENDIAN
 static bool vmx_host_tbl(void)
 {
-    return tcg_can_emit_vec_op(INDEX_op_tbl_vec, TCG_TYPE_V128, MO_8) > 0;
+    return ppc_vmx_host_ops &&
+           tcg_can_emit_vec_op(INDEX_op_tbl_vec, TCG_TYPE_V128, MO_8) > 0;
 }
 #else
 static bool vmx_host_tbl(void)

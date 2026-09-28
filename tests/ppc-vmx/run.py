@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Build vmx_test.c as a raw mac99 firmware image, run it, report results.
 
-usage: run.py [path/to/qemu-system-ppc]
+usage: run.py [--diff] [path/to/qemu-system-ppc]
+
+With --diff the image also runs twice, PPC_VMX_HOST=1 and =0, and the exact
+output hashes of the float ops must agree (old helpers are the oracle).
 
 Needs Homebrew llvm (clang with the PowerPC target) and lld.
 """
@@ -15,8 +18,13 @@ import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-QEMU = (sys.argv[1] if len(sys.argv) > 1 else
+ARGS = [a for a in sys.argv[1:] if a != '--diff']
+DIFF = '--diff' in sys.argv[1:]
+QEMU = (ARGS[0] if ARGS else
         os.path.join(HERE, '..', '..', 'build', 'qemu-system-ppc'))
+DIFF_OPS = ['vaddfp', 'vsubfp', 'vmaxfp', 'vminfp', 'vmaddfp', 'vnmsubfp',
+            'vrefp', 'vrsqrtefp', 'vcfsx', 'vcfux', 'vctsxs', 'vctuxs']
+HASHES = 0x11000
 RESULTS = 0x10000
 OPS = """vperm vperm(d=a) vperm(d=c) vperm(a=b) vsldoi vsldoi(d=b)
 vmrghb vmrghh vmrghw vmrglb vmrglh vmrglw
@@ -88,14 +96,18 @@ class Monitor:
         return [int(x, 16) for x in re.findall(r'0x([0-9a-f]{8})(?!:)', out)][:n]
 
 
-def main():
-    out = tempfile.mkdtemp(prefix='ppc-vmx-')
-    img = build(out)
+def run_image(img, out, host=None):
+    """Run the image; print results; return (failures, hashes)."""
     sock = os.path.join(out, 'mon.sock')
+    if os.path.exists(sock):
+        os.unlink(sock)
+    env = dict(os.environ)
+    if host is not None:
+        env['PPC_VMX_HOST'] = host
     q = subprocess.Popen([QEMU, '-M', 'mac99', '-cpu', '7450', '-m', '64',
                           '-bios', img, '-display', 'none', '-serial', 'none',
                           '-monitor', f'unix:{sock},server=on,wait=off'],
-                         stdout=subprocess.DEVNULL)
+                         stdout=subprocess.DEVNULL, env=env)
     try:
         mon = Monitor(sock)
         for _ in range(600):
@@ -119,9 +131,29 @@ def main():
         for name, t in zip(BENCH, mon.words(RESULTS + 0x800, len(BENCH))):
             print(f'bench {name:36s} {t / tbfreq * 1e3:8.1f} ms')
         print(f'{checks} checks, {fails} failures')
-        sys.exit(1 if fails else 0)
+        hashes = mon.words(HASHES, 2 * len(DIFF_OPS))
+        return fails, hashes
     finally:
         q.kill()
+        q.wait()
+
+
+def main():
+    out = tempfile.mkdtemp(prefix='ppc-vmx-')
+    img = build(out)
+    fails, hashes = run_image(img, out)
+    if DIFF:
+        print('-- again with PPC_VMX_HOST=0 (old helpers)')
+        _, old = run_image(img, out, '0')
+        n = len(DIFF_OPS)
+        for i, (new_h, old_h) in enumerate(zip(hashes, old)):
+            if new_h != old_h:
+                fails += 1
+                print(f'DIFF {DIFF_OPS[i % n]} NJ={i // n}: '
+                      f'host paths {new_h:08x}, old helpers {old_h:08x}')
+        print(f'{2 * n} old-vs-new hashes compared, '
+              f'{sum(a != b for a, b in zip(hashes, old))} differ')
+    sys.exit(1 if fails else 0)
 
 
 if __name__ == '__main__':
