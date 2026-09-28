@@ -5905,6 +5905,13 @@ static bool g_r200_enc_depth_z16;
 static uint64_t g_r200_stat_draws, g_r200_stat_passes, g_r200_stat_flushes,
                 g_r200_stat_conflicts, g_r200_stat_view_hit, g_r200_stat_view_new;
 
+/* qemu#17: how often a texture read forces the read-after-write hazard
+ * flush in r300_texture_full()/r300_texture_raw() (a CPU-side texture
+ * sample racing a write still in the open batch, e.g. Quake II real-dlight
+ * rebuilding the lightmap then binding it the same frame) -- distinct from
+ * g_r200_stat_conflicts, which is the render-target/depth batch conflict. */
+static uint64_t g_r300_stat_tex_hazard_full, g_r300_stat_tex_hazard_raw;
+
 /* VRAM ranges written by render passes in the open batch.  Views that alias
  * the same memory are distinct Metal objects, so Metal does not order a
  * write through one against a read through another: a draw that would read
@@ -7373,6 +7380,7 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
      * checked at this write generation and never looked at again.
      */
     if (!td->host_data && metal_range_busy_r200(st, lo, hi, false)) {
+        g_r300_stat_tex_hazard_full++;
         metal_flush_r200(st);
     }
 
@@ -7586,6 +7594,7 @@ static id<MTLTexture> r300_texture_raw(PPCMacGPUMetalState *st, id<MTLDevice> de
      * (see r300_texture_full). */
     if (!td->host_data && metal_range_busy_r200(st, td->gpu_addr,
                               (uint64_t)td->gpu_addr + td->size_bytes, false)) {
+        g_r300_stat_tex_hazard_raw++;
         metal_flush_r200(st);
     }
     const uint8_t *src = td->host_data ? td->host_data : vram_ptr + td->gpu_addr;
@@ -7969,6 +7978,22 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                                (uint64_t)pkt->tex[t].gpu_addr + pkt->tex[t].size_bytes);
             }
         }
+    }
+
+    if (g_r200_stat_draws % 2000 == 0) {
+        qemu_log("ppc-mac-gpu r300: %llu draws, %llu passes, %llu flushes "
+                 "(%llu batch-conflict, %llu tex-hazard-full, "
+                 "%llu tex-hazard-raw), avg flush %llu us, views %llu hit/%llu new\n",
+                 (unsigned long long)g_r200_stat_draws,
+                 (unsigned long long)g_r200_stat_passes,
+                 (unsigned long long)g_r200_stat_flushes,
+                 (unsigned long long)g_r200_stat_conflicts,
+                 (unsigned long long)g_r300_stat_tex_hazard_full,
+                 (unsigned long long)g_r300_stat_tex_hazard_raw,
+                 (unsigned long long)(g_r200_stat_flushes ?
+                     g_r200_stat_flush_us / g_r200_stat_flushes : 0),
+                 (unsigned long long)g_r200_stat_view_hit,
+                 (unsigned long long)g_r200_stat_view_new);
     }
     return 0;
 }
