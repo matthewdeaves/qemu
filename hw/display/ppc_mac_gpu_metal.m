@@ -5917,6 +5917,16 @@ static uint64_t g_r300_stat_tex_hazard_full, g_r300_stat_tex_hazard_raw;
  * see the counter's own call site for why this differs from a cache hit. */
 static uint64_t g_r300_stat_tex_full_upload, g_r300_stat_tex_full_upload_bytes;
 
+/* qemu#17: which of metal_draw_r300's three batch-conflict checks (depth
+ * buffer, colour buffer(s), bound texture) actually fires -- the conflict
+ * count alone (g_r200_stat_conflicts) dwarfs both tex-hazard counters and
+ * the real flush count above, so it plausibly (not yet confirmed) tracks
+ * r200_new_cb's 32.5% inclusive cost from the ticket's profile more than
+ * either texture-cache counter does. Checked in that priority order, so
+ * these are mutually exclusive per draw. */
+static uint64_t g_r300_stat_conflict_depth, g_r300_stat_conflict_colour,
+                g_r300_stat_conflict_tex;
+
 /* VRAM ranges written by render passes in the open batch.  Views that alias
  * the same memory are distinct Metal objects, so Metal does not order a
  * write through one against a read through another: a draw that would read
@@ -7827,11 +7837,18 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
          * stop the vCPU (it was a flush: 26% of the vCPU in Quake, with
          * the BQL held, which is what made the sound stutter). */
         bool full = g_r200_nwritten >= R200_MAX_WRITTEN - 1 - (int)ncb;
+        int conflict_cause = 0;   /* 0=none, 1=depth, 2=colour, 3=texture */
         bool conflict = want_ds && (r200_batch_conflict(dlo, dhi, &dk) ||
                                     r300_read_conflict(dlo, dhi, &dk));
+        if (conflict) {
+            conflict_cause = 1;
+        }
         for (uint32_t k = 0; k < ncb && !conflict; k++) {
             uint64_t lo = ck[k].offset, hi = lo + (uint64_t)ck[k].pitch * ck[k].height;
             conflict = r200_batch_conflict(lo, hi, &ck[k]) || r300_read_conflict(lo, hi, &ck[k]);
+        }
+        if (conflict && !conflict_cause) {
+            conflict_cause = 2;
         }
         for (int t = 0; t < R300_NUM_TEX_UNITS && !conflict; t++) {
             if (u.tex_info[t][0] && !pkt->tex[t].host_data) {
@@ -7839,10 +7856,18 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                     (uint64_t)pkt->tex[t].gpu_addr + pkt->tex[t].size_bytes, NULL);
             }
         }
+        if (conflict && !conflict_cause) {
+            conflict_cause = 3;
+        }
         if (full) {
             metal_flush_r200(st);
         } else if (conflict) {
             g_r200_stat_conflicts++;
+            switch (conflict_cause) {
+            case 1:  g_r300_stat_conflict_depth++;  break;
+            case 2:  g_r300_stat_conflict_colour++; break;
+            default: g_r300_stat_conflict_tex++;    break;
+            }
             r200_split(st);
         }
         if (!g_r200_cb) {
@@ -7995,13 +8020,17 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
 
     if (g_r200_stat_draws % 2000 == 0) {
         qemu_log("ppc-mac-gpu r300: %llu draws, %llu passes, %llu flushes "
-                 "(%llu batch-conflict, %llu tex-hazard-full, "
+                 "(%llu batch-conflict [%llu depth/%llu colour/%llu tex], "
+                 "%llu tex-hazard-full, "
                  "%llu tex-hazard-raw), avg flush %llu us, views %llu hit/%llu new, "
                  "tex full-upload %llu (%llu KB)\n",
                  (unsigned long long)g_r200_stat_draws,
                  (unsigned long long)g_r200_stat_passes,
                  (unsigned long long)g_r200_stat_flushes,
                  (unsigned long long)g_r200_stat_conflicts,
+                 (unsigned long long)g_r300_stat_conflict_depth,
+                 (unsigned long long)g_r300_stat_conflict_colour,
+                 (unsigned long long)g_r300_stat_conflict_tex,
                  (unsigned long long)g_r300_stat_tex_hazard_full,
                  (unsigned long long)g_r300_stat_tex_hazard_raw,
                  (unsigned long long)(g_r200_stat_flushes ?
