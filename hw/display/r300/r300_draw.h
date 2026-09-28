@@ -200,6 +200,19 @@ typedef struct R300DrawPacket {
     const char *msl;            /* library source; owned by the US cache */
     uint32_t msl_id;            /* unique per distinct msl */
     bool msl_ow_ar;             /* the program writes W from alpha */
+    /*
+     * Vertex shading on the host GPU (R300State.gpu_vs).  When vs_msl is
+     * set, verts is NULL and the renderer draws num_verts indices vs_idx
+     * into vs_in (vs_u->info[0] vec4s per vertex) with the vertex shader
+     * vs_msl (owned by the translation cache, id vs_id) and uniforms
+     * vs_u at Metal vertex buffer 2.  Triangles only (prim_class 0).
+     */
+    const char *vs_msl;
+    uint32_t vs_id;
+    float (*vs_in)[4];
+    uint32_t vs_in_vecs;
+    uint32_t *vs_idx;
+    struct R300VSUniforms *vs_u;
     R300FSUniforms uniforms;
     R300TexDesc tex[R300_NUM_TEX_UNITS];
 
@@ -286,6 +299,16 @@ uint32_t r300_msaa_offset(uint32_t x, uint32_t y, uint32_t ns,
  * unsupported type).  list needs room for 3n + 6 entries. */
 uint32_t r300_assemble(unsigned prim, uint32_t n, uint32_t *list,
                        uint32_t *cls);
+
+/* Must match struct R300VSU in the GPU vertex shader (MSL). */
+typedef struct R300VSUniforms {
+    float c[256][4];            /* PVS constants from CONST_BASE_OFFSET */
+    float ucp[6][4];            /* user clip planes */
+    float vp0[4];               /* viewport x scale, x offset, y scale, y offset */
+    float vp1[4];               /* z scale, z offset, colour buffer W, H */
+    float fogp[4];              /* GA_FOG_SCALE, GA_FOG_OFFSET */
+    uint32_t info[4];           /* x: vec4s per input vertex */
+} R300VSUniforms;
 
 /* Per output primitive: the source primitive's FIRST, SECOND, THIRD and
  * LAST vertex (flat-shading candidates) and its triangle edge flags. */

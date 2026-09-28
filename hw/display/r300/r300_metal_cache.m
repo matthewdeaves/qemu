@@ -6,7 +6,8 @@
 #include <unistd.h>
 
 id<MTLBinaryArchive> r300_metal_cache_open(id<MTLDevice> dev, NSString *dir,
-    const char *source, const MTLPixelFormat *formats, unsigned count,
+    const char *source, const char *vertex_source,
+    const MTLPixelFormat *formats, unsigned count,
     MTLPixelFormat depth, NSURL **url, bool *loaded, NSError **error)
 {
     *loaded = false;
@@ -15,7 +16,17 @@ id<MTLBinaryArchive> r300_metal_cache_open(id<MTLDevice> dev, NSString *dir,
         return nil;
     }
     unsigned char digest[CC_SHA256_DIGEST_LENGTH];
-    CC_SHA256(source, (CC_LONG)strlen(source), digest);
+    /* Include stage boundaries and math policy: old fast-math archives
+     * must never satisfy a safe vertex-program pipeline. */
+    CC_SHA256_CTX ctx;
+    CC_SHA256_Init(&ctx);
+    const char version[] = "r300-vs-safe-v1";
+    CC_SHA256_Update(&ctx, version, sizeof(version));
+    CC_SHA256_Update(&ctx, source, (CC_LONG)strlen(source) + 1);
+    if (vertex_source) {
+        CC_SHA256_Update(&ctx, vertex_source, (CC_LONG)strlen(vertex_source) + 1);
+    }
+    CC_SHA256_Final(digest, &ctx);
     NSMutableString *key = [NSMutableString string];
     for (unsigned i = 0; i < sizeof(digest); i++) {
         [key appendFormat:@"%02x", digest[i]];

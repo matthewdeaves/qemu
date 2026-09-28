@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include "r300_pvs.h"
+#include "r300_sb.h"
 
 /* Registers used here */
 #define SE_VPORT_XSCALE             0x1D98  /* then XOFFSET, YSCALE, ... ZOFFSET */
@@ -60,6 +61,7 @@
 #define RB3D_BLEND_COLOR            0x4E10
 #define RB3D_ROPCNTL                0x4E18
 #define RB3D_COLOROFFSET0           0x4E28
+#define RB3D_AARESOLVE_CTL          0x4E88
 #define RB3D_COLORPITCH0            0x4E38
 #define SU_POLY_OFFSET_FRONT_SCALE  0x42A4  /* then FRONT_OFFSET, BACK_SCALE, BACK_OFFSET */
 #define SU_POLY_OFFSET_ENABLE       0x42B4
@@ -1183,6 +1185,370 @@ static float s312(uint32_t v)
     return (int16_t)(v & 0xFFFF) / 4096.0f;
 }
 
+/* Read once per process, as the other R300 runtime safety switches do. */
+static bool r300_draw_gpu_vs_enabled(const R300State *st)
+{
+    static int cpu_vs = -1;
+    if (cpu_vs < 0) {
+        cpu_vs = getenv("R300_CPU_VS") != NULL;
+    }
+    return st->gpu_vs && !cpu_vs;
+}
+
+/*
+ * ---- Vertex shading on the host GPU ----
+ *
+ * The CPU interpreter (r300_pvs_run) plus the per-vertex work after it --
+ * viewport transform, colour and texture interpolant routing, fog, user
+ * clip distances -- as one generated vertex shader, for the draws where
+ * nothing after the vertex program needs whole primitives: filled
+ * triangles with smooth colours.  Everything else stays on the CPU.
+ */
+
+/* Which inputs the shader reads, packed in this order per vertex. */
+typedef struct GpuVs {
+    char *msl;
+    uint32_t id;
+    uint32_t in_used;
+    uint32_t *key;
+    unsigned klen;
+    struct GpuVs *next;
+} GpuVs;
+
+#define GPU_VS_BUCKETS 1024
+static GpuVs *gpu_vs_cache[GPU_VS_BUCKETS];
+static uint32_t gpu_vs_next_id = 1;
+
+static void key_push(uint32_t *key, unsigned *n, uint32_t value)
+{
+    key[(*n)++] = value;
+}
+
+static void gpu_vs_emit_post(R300Sb *sb, const R300State *st, const Layout *lay,
+                             const Route *route, bool persp, bool fog,
+                             uint32_t fogsel, uint32_t clip)
+{
+    static const char comp[] = "xyzw";
+
+    r300_sb_printf(sb, "    float4 cp = o%d;\n    float4 p;\n", lay->pos);
+    if (persp) {
+        r300_sb_printf(sb,
+            "    p = float4((2.0f * vs.vp0.x / vs.vp1.z) * cp.x + (2.0f * vs.vp0.y / vs.vp1.z - 1.0f) * cp.w,\n"
+            "             -(2.0f * vs.vp0.z / vs.vp1.w) * cp.y + (1.0f - 2.0f * vs.vp0.w / vs.vp1.w) * cp.w,\n"
+            "             vs.vp1.x * cp.z + vs.vp1.y * cp.w, cp.w);\n");
+    } else {
+        r300_sb_printf(sb,
+            "    p = float4(2.0f * (vs.vp0.x * cp.x + vs.vp0.y) / vs.vp1.z - 1.0f,\n"
+            "             1.0f - 2.0f * (vs.vp0.z * cp.y + vs.vp0.w) / vs.vp1.w,\n"
+            "             vs.vp1.x * cp.z + vs.vp1.y, 1.0f);\n");
+    }
+    r300_sb_printf(sb, "    o.pos = float4(p.xy + ms.xy * p.w, p.zw);\n");
+    for (int c = 0; c < 4; c++) {
+        if (lay->color[c] >= 0) {
+            r300_sb_printf(sb, "    float4 col%d = o%d;\n", c, lay->color[c]);
+        } else {
+            r300_sb_printf(sb, "    float4 col%d = float4(0.0f);\n", c);
+        }
+    }
+    for (unsigned k = 0; k < R300_NUM_VARYINGS; k++) {
+        char e[4][24];
+        if (k >= route->nvary) {
+            r300_sb_printf(sb, "    o.v%u = float4(0.0f);\n", k);
+            continue;
+        }
+        uint32_t ip = r300_reg(st, RS_IP_0 + 4 * route->vary[k].ip);
+        for (unsigned i = 0; i < 4; i++) {
+            if (route->vary[k].is_tex) {
+                unsigned sel = (ip >> (13 + 3 * i)) & 7, sc = (ip & 0x3F) + sel;
+                if (sel < 4 && sc < lay->nscal) {
+                    snprintf(e[i], sizeof(e[i]), "o%u.%c", lay->scal_slot[sc],
+                             comp[lay->scal_comp[sc]]);
+                } else {
+                    snprintf(e[i], sizeof(e[i]), sel == 5 ? "1.0f" : "0.0f");
+                }
+            } else {
+                static const int8_t tbl[16][4] = {
+                    [0] = { 0, 1, 2, 3 },  [1] = { 0, 1, 2, -1 }, [2] = { 0, 1, 2, -2 },
+                    [4] = { -1, -1, -1, 3 }, [5] = { -1, -1, -1, -1 }, [6] = { -1, -1, -1, -2 },
+                    [8] = { -2, -2, -2, 3 }, [9] = { -2, -2, -2, -1 }, [10] = { -2, -2, -2, -2 },
+                };
+                unsigned cp = (ip >> 6) & 7;
+                int t = tbl[(ip >> 9) & 0xF][i];
+                if (t >= 0 && cp < 4) {
+                    snprintf(e[i], sizeof(e[i]), "col%u.%c", cp, comp[t]);
+                } else {
+                    snprintf(e[i], sizeof(e[i]), t == -2 ? "1.0f" : "0.0f");
+                }
+            }
+        }
+        r300_sb_printf(sb, "    o.v%u = float4(%s, %s, %s, %s);\n", k, e[0], e[1], e[2], e[3]);
+    }
+    if (fog) {
+        const char *src;
+        char buf[32];
+        if (fogsel < 4) {
+            if (lay->color[fogsel] >= 0) {
+                snprintf(buf, sizeof(buf), "o%d.w", lay->color[fogsel]);
+                src = buf;
+            } else {
+                src = "0.0f";
+            }
+        } else if (fogsel == 4) {
+            snprintf(buf, sizeof(buf), "o%d.w", lay->pos);
+            src = buf;
+        } else {
+            src = "p.z / (p.w != 0.0f ? p.w : 1.0f)";
+        }
+        r300_sb_printf(sb, "    o.aux = float4(%s * vs.fogp.x + vs.fogp.y, 0.0f, 0.0f, 0.0f);\n", src);
+    } else {
+        r300_sb_printf(sb, "    o.aux = float4(0.0f);\n");
+    }
+    if (clip & 0x3F) {
+        for (int k = 0; k < 6; k++) {
+            if ((clip >> k) & 1) {
+                r300_sb_printf(sb, "    o.clip[%d] = dot(cp, vs.ucp[%d]);\n", k, k);
+            } else {
+                r300_sb_printf(sb, "    o.clip[%d] = 1.0f;\n", k);
+            }
+        }
+    }
+}
+
+/* The vertex shader for the current state (remembered), or NULL. */
+static const GpuVs *gpu_vs_get(const R300State *st, const R300PVSProgram *prog,
+                               const Layout *lay, const Route *route)
+{
+    bool persp = !((r300_reg(st, VAP_VTE_CNTL) >> 8) & 1);
+    bool fog = r300_reg(st, FG_FOG_BLEND) & 1;
+    uint32_t fogsel = r300_reg(st, GB_SELECT) & 7;
+    uint32_t clip = r300_reg(st, VAP_CLIP_CNTL) & 0x3F;
+    uint32_t key_buf[5 + R300_PVS_MAX_INSTS * 4 + sizeof(Layout) / 4 +
+                     1 + R300_NUM_VARYINGS * 2];
+    uint32_t *key = key_buf;
+    unsigned klen = 0;
+
+    if (prog->last_inst < prog->first_inst || prog->last_inst >= R300_PVS_MAX_INSTS) {
+        return NULL;
+    }
+    key_push(key, &klen, prog->first_inst);
+    key_push(key, &klen, prog->last_inst);
+    key_push(key, &klen, prog->max_const);
+    key_push(key, &klen, prog->fc_opc);
+    key_push(key, &klen, persp | fog << 1 | fogsel << 2 | clip << 8);
+    for (unsigned k = prog->first_inst * 4; k < (prog->last_inst + 1) * 4; k++) {
+        key_push(key, &klen, prog->code[k]);
+    }
+    memcpy(&key[klen], lay, sizeof(*lay));
+    klen += sizeof(*lay) / sizeof(*key);
+    key_push(key, &klen, route->nvary);
+    for (unsigned k = 0; k < route->nvary; k++) {
+        key_push(key, &klen, route->vary[k].is_tex);
+        key_push(key, &klen, r300_reg(st, RS_IP_0 + 4 * route->vary[k].ip));
+    }
+
+    uint32_t hash = 2166136261u;
+    for (unsigned k = 0; k < klen; k++) {
+        hash = (hash ^ key[k]) * 16777619u;
+    }
+    GpuVs **bucket = &gpu_vs_cache[hash % GPU_VS_BUCKETS];
+    for (GpuVs *m = *bucket; m; m = m->next) {
+        if (m->klen == klen && !memcmp(m->key, key, klen * 4)) {
+            return m->msl ? m : NULL;
+        }
+    }
+
+    /* Generate.  A program the translation cannot take is remembered as
+     * such (msl NULL), so it isn't retried every draw. */
+    R300Sb body, sb;
+    uint32_t in_used = 0;
+    char *msl = NULL;
+    r300_sb_init(&body);
+    if (r300_pvs_to_msl(prog, &body, &in_used)) {
+        r300_sb_init(&sb);
+        r300_sb_printf(&sb,
+            "#include <metal_stdlib>\nusing namespace metal;\n%s"
+            "struct R300VSU { float4 c[256]; float4 ucp[6]; float4 vp0; float4 vp1; float4 fogp; uint4 info; };\n"
+            "struct R300VOutC {\n"
+            "    float4 pos [[position]];\n"
+            "    float4 v0 [[user(v0)]], v1 [[user(v1)]], v2 [[user(v2)]];\n"
+            "    float4 v3 [[user(v3)]], v4 [[user(v4)]], v5 [[user(v5)]];\n"
+            "    float4 v6 [[user(v6)]], v7 [[user(v7)]], v8 [[user(v8)]];\n"
+            "    float4 v9 [[user(v9)]], aux [[user(aux)]];\n%s};\n"
+            "float4 pvs_c(constant float4 *c, int x) { return x >= 0 && x <= %d ? c[x] : float4(0.0f); }\n"
+            "vertex R300VOutC r300_vs(uint vid [[vertex_id]],\n"
+            "    const device float4 *vin [[buffer(0)]], constant float4 &ms [[buffer(1)]],\n"
+            "    constant R300VSU &vs [[buffer(2)]])\n{\n"
+            "    R300VOutC o;\n    uint vb = vid * vs.info.x;\n",
+            r300_pvs_msl_helpers,
+            clip ? "    float clip [[clip_distance]] [6];\n" : "",
+            prog->max_const);
+        for (unsigned i = 0, slot = 0; i < R300_PVS_NUM_INPUTS; i++) {
+            if (in_used & (1u << i)) {
+                r300_sb_printf(&sb, "    float4 i%u = vin[vb + %uu];\n", i, slot++);
+            }
+        }
+        r300_sb_printf(&sb, "%s", body.buf);
+        gpu_vs_emit_post(&sb, st, lay, route, persp, fog, fogsel, clip);
+        r300_sb_printf(&sb, "    return o;\n}\n");
+        msl = r300_sb_steal(&sb);
+    }
+    r300_sb_free(&body);
+
+    GpuVs *m = calloc(1, sizeof(*m));
+    if (!m) {
+        free(msl);
+        return NULL;
+    }
+    key = malloc(klen * sizeof(*key));
+    if (!key) {
+        free(m);
+        free(msl);
+        return NULL;
+    }
+    memcpy(key, key_buf, klen * sizeof(*key));
+    *m = (GpuVs){ .msl = msl, .id = msl ? gpu_vs_next_id++ : 0,
+                  .in_used = in_used, .key = key, .klen = klen, .next = *bucket };
+    *bucket = m;
+    return msl ? m : NULL;
+}
+
+/*
+ * The GPU-shaded form of a draw: decoded input vertices (each index
+ * once), the triangle list as indices into them, and the uniforms.
+ * Returns false (pkt untouched) when the draw needs the CPU path;
+ * *failed when fetching the vertices failed (the draw is dropped).
+ */
+static bool gpu_vs_build(const R300State *st, Fetch *f, const R300PVSProgram *prog,
+                         const Layout *lay, const Route *route, uint32_t prim,
+                         const uint32_t *order, uint32_t n, R300DrawPacket *pkt,
+                         bool *failed, const char **err)
+{
+    uint32_t colctl = r300_reg(st, GA_COLOR_CONTROL);
+
+    *failed = false;
+    if ((r300_reg(st, RB3D_AARESOLVE_CTL) & 1) || /* AARESOLVE_CTL: CPU bounds */
+        (r300_reg(st, GA_POLY_MODE) & 3) == 1 ||
+        (r300_reg(st, VAP_OUTPUT_VTX_FMT_0) & (3u << 3))) {
+        return false;               /* polygon mode, two-sided colours */
+    }
+    for (int c = 0; c < 4; c++) {
+        if (((colctl >> (4 * c)) & 3) != 2 || ((colctl >> (4 * c + 2)) & 3) != 2) {
+            return false;           /* flat or solid colours */
+        }
+    }
+    uint32_t *list = malloc(sizeof(uint32_t) * (n * 3 + 6));
+    if (!list) {
+        *failed = true;
+        *err = "out of memory";
+        return false;
+    }
+    uint32_t cls, nidx = r300_assemble_prov(prim, n, list, &cls, NULL);
+    if (!nidx || cls != 0) {
+        free(list);
+        return false;               /* lines and points: expanded on the CPU */
+    }
+    const GpuVs *vs = gpu_vs_get(st, prog, lay, route);
+    if (!vs) {
+        free(list);
+        return false;
+    }
+
+    unsigned nin = 0;
+    uint8_t slots[R300_PVS_NUM_INPUTS];
+    for (unsigned i = 0; i < R300_PVS_NUM_INPUTS; i++) {
+        if (vs->in_used & (1u << i)) {
+            slots[nin++] = i;
+        }
+    }
+    unsigned stride = nin ? nin : 1;
+
+    /* Each distinct index once; pos[] maps draw positions to them. */
+    uint32_t hn = 8;
+    while (hn < 2 * n) {
+        hn <<= 1;
+    }
+    uint32_t *hkey = malloc(hn * sizeof(*hkey)), *hval = malloc(hn * sizeof(*hval));
+    uint32_t *pos = malloc(n * sizeof(*pos));
+    float (*in)[4] = malloc((size_t)n * stride * sizeof(*in));
+    uint32_t nu = 0;
+    if (!hkey || !hval || !pos || !in) {
+        free(hkey); free(hval); free(pos); free(in); free(list);
+        *failed = true;
+        *err = "out of memory";
+        return false;
+    }
+    memset(hval, 0xFF, hn * sizeof(*hval));
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t h = (order[i] * 2654435761u) & (hn - 1);
+        while (hval[h] != UINT32_MAX && hkey[h] != order[i]) {
+            h = (h + 1) & (hn - 1);
+        }
+        if (hval[h] == UINT32_MAX) {
+            float v[R300_PVS_NUM_INPUTS][4];
+            if (!fetch_vertex(f, order[i], v)) {
+                *err = f->why ? f->why : "vertex data out of range";
+                *failed = true;
+                free(hkey); free(hval); free(pos); free(in); free(list);
+                return false;
+            }
+            for (unsigned k = 0; k < nin; k++) {
+                memcpy(in[nu * stride + k], v[slots[k]], sizeof(v[0]));
+            }
+            if (!nin) {
+                memset(in[nu * stride], 0, sizeof(in[0]));
+            }
+            hkey[h] = order[i];
+            hval[h] = nu++;
+        }
+        pos[i] = hval[h];
+    }
+    for (uint32_t k = 0; k < nidx; k++) {
+        list[k] = pos[list[k]];
+    }
+    free(hkey);
+    free(hval);
+    free(pos);
+
+    R300VSUniforms *u = calloc(1, sizeof(*u));
+    if (!u) {
+        free(in); free(list);
+        *failed = true;
+        *err = "out of memory";
+        return false;
+    }
+    memcpy(u->c, prog->consts, (prog->max_const + 1) * sizeof(u->c[0]));
+    for (int k = 0; k < 6; k++) {
+        memcpy(u->ucp[k], &st->pvs_mem[(R300_PVS_UCP_START + k) * 4], sizeof(u->ucp[k]));
+    }
+    uint32_t vte = r300_reg(st, VAP_VTE_CNTL);
+    float vp[6];
+    for (int i = 0; i < 6; i++) {
+        vp[i] = (vte >> i) & 1 ? bits_to_float(r300_reg(st, SE_VPORT_XSCALE + 4 * i))
+                               : (i % 2 ? 0.0f : 1.0f);
+    }
+    memcpy(u->vp0, vp, sizeof(u->vp0));
+    u->vp1[0] = vp[4];
+    u->vp1[1] = vp[5];
+    u->vp1[2] = pkt->rt_width;
+    u->vp1[3] = pkt->rt_height;
+    u->fogp[0] = bits_to_float(r300_reg(st, GA_FOG_SCALE));
+    u->fogp[1] = bits_to_float(r300_reg(st, GA_FOG_OFFSET));
+    u->info[0] = stride;
+
+    pkt->vs_msl = vs->msl;
+    pkt->vs_id = vs->id;
+    pkt->vs_in = in;
+    pkt->vs_in_vecs = nu * stride;
+    pkt->vs_idx = list;
+    pkt->vs_u = u;
+    pkt->verts = NULL;
+    pkt->num_verts = nidx;
+    pkt->num_line_verts = 0;
+    pkt->prim_class = 0;
+    pkt->cull = ((1u << prim) & 0xE0F0u) ? r300_reg(st, SU_CULL_MODE) & 7 : 0;
+    return true;
+}
+
 /*
  * Everything after vertex ordering.  order[] (n entries, malloc'd) is
  * taken over; immd is the DRAW_IMMD_2 vertex data or NULL.
@@ -1310,7 +1676,7 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
             prog.fc_addrs[i] = r300_reg(st, VAP_PVS_FLOW_CNTL_ADDRS_0 + 4 * i);
             prog.fc_loop[i] = r300_reg(st, VAP_PVS_FLOW_CNTL_LOOP_INDEX_0 + 4 * i);
         }
-        r300_pvs_prepare(&prepared, &prog);
+
     }
 
     output_layout(st, &lay);
@@ -1320,6 +1686,30 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
      * parallelogram (v0 + v2 - v1) and draws it as a quad. */
     bool rects = prim == 8;
     uint32_t nsrc = rects ? n / 3 * 4 : n;
+
+    if (r300_draw_gpu_vs_enabled(st) && !rects && !bypass) {
+        bool failed;
+        if (gpu_vs_build(st, &f, &prog, &lay, &route, prim, order, n, pkt,
+                         &failed, err)) {
+            pkt->warn |= f.warn;
+            free(order);
+            pkt->msl = r300_us_msl_cached(st, &desc, &pkt->msl_id,
+                                          &pkt->msl_ow_ar, err);
+            if (!pkt->msl) {
+                r300_draw_free(pkt);
+                return false;
+            }
+            return true;
+        }
+        if (failed) {
+            free(order);
+            return false;
+        }
+    }
+
+    if (!bypass) {
+        r300_pvs_prepare(&prepared, &prog);
+    }
 
     /* Transform every vertex in draw order (cheap next to the GPU work).
      * An indexed draw names most vertices more than once; the fetch and
@@ -1698,6 +2088,13 @@ bool r300_draw_build_indexed(const R300State *st, const R300Arrays *arr,
 void r300_draw_free(R300DrawPacket *pkt)
 {
     free(pkt->verts);
+    free(pkt->vs_in);
+    free(pkt->vs_idx);
+    free(pkt->vs_u);
+    pkt->vs_msl = NULL;
+    pkt->vs_in = NULL;
+    pkt->vs_idx = NULL;
+    pkt->vs_u = NULL;
     pkt->msl = NULL;
     pkt->verts = NULL;
     for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
@@ -1813,7 +2210,7 @@ void r300_lightlog_draw(const R300State *st, const R300DrawPacket *pkt)
         fprintf(f, "STATE END\n");
         last_pvs = st->pvs_gen;
     }
-    for (unsigned v = 0; v < pkt->num_verts && v < 3; v++) {
+    for (unsigned v = 0; pkt->verts && v < pkt->num_verts && v < 3; v++) {
         const R300Vertex *x = &pkt->verts[v];
         fprintf(f, "VERT D%llu v%u clip=%g,%g,%g,%g", draw, v,
                 x->pos[0], x->pos[1], x->pos[2], x->pos[3]);

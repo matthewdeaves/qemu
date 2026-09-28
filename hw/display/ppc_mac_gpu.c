@@ -262,6 +262,7 @@ static uint64_t r200_flush_why[0x10000 / 4 + 8];
 static uint64_t r200_flush_total;
 static struct {
     uint64_t presents, draws, ops2d, flushes, flush_us, flips;
+    uint64_t gpu_vs;
     /* QemuMac#21: how often a draw's colour render target gets redirected
      * through the GART/AGP scratch copy-out (qemu#7, b60a6d9936) instead of
      * landing straight in VRAM -- expected only on a guest capture
@@ -1548,11 +1549,12 @@ static void ppc_mac_gpu_display_update(void *opaque)
             if (TRACE_ON("PPCGPU_RATE") && (r200_rate.draws || r200_rate.ops2d)) {
                 double sec = (now - r200_rate.since) / 1e6;
                 qemu_log("ppc-mac-gpu rate: %.1f flips/s, %.1f present-ops/s, "
-                         "%.0f draws/s, "
+                         "%.0f draws/s (%.0f%% GPU vertex programs), "
                          "%.0f 2D ops/s, %.0f flushes/s, GPU wait %.1f%%, "
                          "%.0f GART copy-outs/s\n",
                          r200_rate.flips / sec,
                          r200_rate.presents / sec, r200_rate.draws / sec,
+                         r200_rate.draws ? 100.0 * r200_rate.gpu_vs / r200_rate.draws : 0.0,
                          r200_rate.ops2d / sec, r200_rate.flushes / sec,
                          r200_rate.flush_us / (sec * 1e4),
                          r200_rate.gart_copyouts / sec);
@@ -3066,6 +3068,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
             g_free(key);
         }
     }
+    s->r3->gpu_vs = s->renderer && s->renderer->r300_gpu_vs;
     bool build_ok = idx ?
         r300_draw_build_indexed(s->r3, &s->r3_arrays, d[0], idx, r300_read_raw,
                                 s, &pkt, &err) :
@@ -3080,7 +3083,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                 r300_reg(s->r3, 0x4480), r300_reg(s->r3, 0x44C0),
                 r300_reg(s->r3, 0x4500), pkt.scissor[0], pkt.scissor[1],
                 pkt.scissor[2], pkt.scissor[3], build_ok ? pkt.num_verts : 0);
-        for (uint32_t v = 0; build_ok && v < pkt.num_verts && v < 48; v++) {
+        for (uint32_t v = 0; build_ok && pkt.verts && v < pkt.num_verts && v < 48; v++) {
             const R300Vertex *x = &pkt.verts[v];
             fprintf(s->r3_dump, "   v%u ndc %.3f %.3f w %.3f  t %.4f %.4f %.4f %.4f"
                     " | %.4f %.4f %.4f %.4f\n", v, x->pos[0] / x->pos[3],
@@ -3263,6 +3266,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         if (sync_each < 0) {
             sync_each = getenv("R300_SYNC") != NULL;   /* debug: no batching */
         }
+        r200_rate.gpu_vs += pkt.vs_msl != NULL;
         FILE *lf = r300_lightlog();
         if (lf) {
             fprintf(lf, "TIME D%llu real_us=%lld monotonic_us=%lld\n",
@@ -3327,7 +3331,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                             pkt.uniforms.cliprect[0][1], pkt.uniforms.cliprect[0][2],
                             pkt.uniforms.cliprect[0][3], pkt.scissor[0],
                             pkt.scissor[1], pkt.scissor[2], pkt.scissor[3]);
-                    for (uint32_t v = 0; v < pkt.num_verts && v < 6; v++) {
+                    for (uint32_t v = 0; pkt.verts && v < pkt.num_verts && v < 6; v++) {
                         const R300Vertex *x = &pkt.verts[v];
                         fprintf(s->r3_dump, "   v%u pos %.3f %.3f %.3f %.3f  v0 %.4f %.4f %.4f %.4f"
                                 "  v1 %.4f %.4f %.4f %.4f\n", v, x->pos[0], x->pos[1],

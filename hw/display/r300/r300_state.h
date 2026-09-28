@@ -34,6 +34,7 @@ typedef struct R300State {
     uint32_t pvs_upload_dw;                    /* next dword to write */
     uint64_t pvs_gen;       /* bumps when PVS code/constants change */
     uint64_t draws;
+    bool gpu_vs;           /* renderer capability; false for non-Metal */
 } R300State;
 
 void r300_state_reset(R300State *st);

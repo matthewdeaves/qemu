@@ -6,8 +6,8 @@
  * "R5xx Acceleration" guide, section 7.5, restricted to what R3xx/R4xx
  * implement.
  *
- * This is a reference interpreter: the device runs vertex programs on the
- * host CPU and hands Metal post-transform vertices.  Pure C, no QEMU
+ * The reference interpreter handles CPU fallbacks; the MSL translator
+ * runs supported straight-line programs on Metal. Pure C, no QEMU
  * dependencies.
  *
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
@@ -88,5 +88,19 @@ uint32_t r300_pvs_run(const R300PVSProgram *prog,
 
 /* One line of disassembly per instruction into buf; for traces. */
 void r300_pvs_disasm_inst(const uint32_t d[4], char *buf, unsigned len);
+
+/*
+ * The program as MSL statements for the body of a vertex shader's main()
+ * (declarations first): inputs are read from locals iN (the caller loads
+ * those *in_used names), constants from uniform vs.c[] with a function
+ * float4 pvs_c(constant float4 *, int) for A0-relative reads (the caller defines it), and the
+ * outputs land in locals o0..o31.  r300_pvs_msl_helpers goes at file
+ * scope.  False when the program needs the interpreter (flow control,
+ * predication, relative temporaries or outputs, unknown opcodes).
+ */
+struct R300Sb;
+extern const char r300_pvs_msl_helpers[];
+bool r300_pvs_to_msl(const R300PVSProgram *prog, struct R300Sb *sb,
+                      uint32_t *in_used);
 
 #endif

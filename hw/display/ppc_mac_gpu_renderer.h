@@ -319,6 +319,7 @@ typedef struct PPCMacGPURenderer {
      * rt_gpu_addr and tex[].gpu_addr are already VRAM offsets.  Batched
      * with draw_r200 work: flush_r200() finishes both.
      */
+    bool r300_gpu_vs;      /* accepts GPU vertex program packets */
     int (*draw_r300)(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                      const struct R300DrawPacket *pkt);
 
