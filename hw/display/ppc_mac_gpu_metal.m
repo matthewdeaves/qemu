@@ -1021,17 +1021,8 @@ static void *metal_init(uint8_t *vram_ptr, uint64_t vram_size)
             return NULL;
         }
 
-        /* qemu#17: -[MTLDevice newCommandQueue] defaults to a queue that
-         * blocks -[MTLCommandQueue commandBuffer] once 64 committed command
-         * buffers are uncompleted. r200_split() commits a new one on every
-         * batch-conflict without ever waiting for it (that's the whole
-         * point -- ordering is via a shared event, not a CPU-side wait), so
-         * a run with tens of thousands of splits and no matching flushes
-         * races far ahead of the GPU and hits that cap; r200_new_cb's own
-         * counter showed calls climbing from ~1us to ~155us average as the
-         * backlog built up, 34.5% of one demo1 run's wall-clock. Ask for a
-         * deeper queue instead of removing the guard the cap exists for. */
-        st->commandQueue = [st->device newCommandQueueWithMaxCommandBufferCount:2048];
+        /* Create command queue */
+        st->commandQueue = [st->device newCommandQueue];
         if (!st->commandQueue) {
             qemu_log_mask(LOG_UNIMP,
                           "ppc-mac-gpu-metal: failed to create command queue\n");
