@@ -1,6 +1,7 @@
 # CI for the radeon-9700 branch only: build qemu-system-ppc with the R300
-# Radeon 9700 PRO / Metal backend and run its offline test_r300 suite
-# (tests/r300/run.sh). Upstream's own workflows (lockdown.yml) are PR-comment
+# Radeon 9700 PRO / Metal backend and run its offline test suites
+# (tests/r300/run.sh, tests/audio/run.sh). Upstream's own workflows
+# (lockdown.yml) are PR-comment
 # only and unaffected by this; upstream carries no build/test workflow on
 # this fork to disable. This repo is a public fork, so macos-latest runners
 # are free (qemu#19).
@@ -59,3 +60,6 @@ jobs:
 
       - name: tests/r300
         run: sh tests/r300/run.sh
+
+      - name: tests/audio
+        run: sh tests/audio/run.sh

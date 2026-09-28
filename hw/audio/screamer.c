@@ -186,10 +186,27 @@ static void screamer_pace_cb(void *opaque)
     while (due > 0 && s->io.len) {
         int n = pmac_screamer_tx_transfer(s, due);
         if (n == 0) {
-            break;                          /* ring full: backend is behind */
+            if (s->voice) {
+                break;                      /* ring full: backend is behind */
+            }
+            /* No voice to blame: the ring was already full (e.g. left over
+             * from before the voice closed) rather than filled by this
+             * transfer, so the drain below never got a chance to run. Drain
+             * it here too and retry -- there's always room once drained,
+             * since the ring exists whenever this runs (qemu#21). */
+            s->rpos = s->wpos;
+            s->primed = false;
+            continue;
         }
         due -= n;
         moved += n;
+        if (!s->voice) {
+            /* No host output: play to nowhere. Clear primed too, so a voice
+             * that reopens later refills its jitter buffer before resuming
+             * playback instead of resuming mid-silence with none queued. */
+            s->rpos = s->wpos;
+            s->primed = false;
+        }
     }
     if (moved) {
         s->pace_idle = 0;
@@ -347,18 +364,26 @@ static void screamer_update_settings(ScreamerState *s)
     struct audsettings as = { s->rate, 2, AUDIO_FORMAT_S16,
         1 };
 
-    s->voice = audio_be_open_out(s->audio_be, s->voice, s_spk, s, screamerspk_callback, &as);
-    if (!s->voice) {
-        warn_report("screamer: could not open the audio voice");
-        return;
-    }
-
+    /*
+     * The ring first: the guest's DMA fills it whether or not the host has
+     * a voice for it. Without one, the ring stayed unallocated (samples
+     * stayed 0) or, once allocated, just filled up and stalled since
+     * nothing ever drained it -- either way the guest's DBDMA transfer
+     * never completes, which looks like a hang, not silence. See the
+     * !s->voice drain in screamer_pace_cb below.
+     */
     s->shift = 2;
     if (!s->mixbuf) {
         /* SCREAMER_RING=<frames> overrides the default (for tuning) */
         const char *e = getenv("SCREAMER_RING");
         s->samples = e ? MAX(atoi(e), 256) : SCREAMER_RING_FRAMES;
         s->mixbuf = g_malloc0(s->samples << s->shift);
+    }
+
+    s->voice = audio_be_open_out(s->audio_be, s->voice, s_spk, s, screamerspk_callback, &as);
+    if (!s->voice) {
+        warn_report("screamer: could not open the audio voice");
+        return;
     }
 
     audio_be_set_active_out(s->audio_be, s->voice, true);
