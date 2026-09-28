@@ -1,0 +1,61 @@
+# CI for the radeon-9700 branch only: build qemu-system-ppc with the R300
+# Radeon 9700 PRO / Metal backend and run its offline test_r300 suite
+# (tests/r300/run.sh). Upstream's own workflows (lockdown.yml) are PR-comment
+# only and unaffected by this; upstream carries no build/test workflow on
+# this fork to disable. This repo is a public fork, so macos-latest runners
+# are free (qemu#19).
+name: radeon-9700 CI
+
+on:
+  push:
+    branches: [radeon-9700]
+  pull_request:
+    branches: [radeon-9700]
+
+jobs:
+  build-and-test:
+    name: Build + tests/r300 (macos-latest)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same core + optional deps install-deps.sh's macOS path installs,
+      # minus qemu itself (built from source here) and the runtime-only
+      # jq/curl/unzip/hfsprogs group (unused by this build+test job).
+      - name: Install build dependencies
+        run: |
+          brew install libffi gettext glib pkg-config pixman ninja meson ccache
+          brew install sdl2 sdl2_image libusb gnutls libssh libslirp jpeg libpng
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/ccache
+          key: radeon-ci-ccache-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            radeon-ci-ccache-${{ runner.os }}-
+
+      - name: Configure
+        run: |
+          ./configure \
+            --target-list=ppc-softmmu,m68k-softmmu \
+            --disable-docs \
+            --disable-guest-agent \
+            --enable-cocoa \
+            --enable-sdl \
+            --enable-sdl-image \
+            --enable-slirp \
+            --disable-nettle \
+            --enable-gnutls \
+            --enable-png \
+            --enable-libusb \
+            --enable-libssh \
+            --audio-drv-list=coreaudio \
+            --prefix="$PWD/qemu-install"
+
+      - name: Build
+        run: PATH="/usr/bin:$PATH" make -j"$(sysctl -n hw.ncpu)"
+
+      - name: tests/r300
+        run: sh tests/r300/run.sh
