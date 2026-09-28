@@ -261,6 +261,14 @@ static uint64_t r200_flush_why[0x10000 / 4 + 8];
 static uint64_t r200_flush_total;
 static struct {
     uint64_t presents, draws, ops2d, flushes, flush_us, flips;
+    /* QemuMac#21: how often a draw's colour render target gets redirected
+     * through the GART/AGP scratch copy-out (qemu#7, b60a6d9936) instead of
+     * landing straight in VRAM -- expected only on a guest capture
+     * (screenshotJPEG-style) target, never on an ordinary VRAM-backed
+     * gameplay draw; a nonzero per-second rate here on plain gameplay would
+     * confirm QemuMac#21's hypothesis A (the copy-out firing on ordinary
+     * frames) instead of B (noise). */
+    uint64_t gart_copyouts;
     int64_t since;
 } r200_rate;
 
@@ -1540,11 +1548,13 @@ static void ppc_mac_gpu_display_update(void *opaque)
                 double sec = (now - r200_rate.since) / 1e6;
                 qemu_log("ppc-mac-gpu rate: %.1f flips/s, %.1f present-ops/s, "
                          "%.0f draws/s, "
-                         "%.0f 2D ops/s, %.0f flushes/s, GPU wait %.1f%%\n",
+                         "%.0f 2D ops/s, %.0f flushes/s, GPU wait %.1f%%, "
+                         "%.0f GART copy-outs/s\n",
                          r200_rate.flips / sec,
                          r200_rate.presents / sec, r200_rate.draws / sec,
                          r200_rate.ops2d / sec, r200_rate.flushes / sec,
-                         r200_rate.flush_us / (sec * 1e4));
+                         r200_rate.flush_us / (sec * 1e4),
+                         r200_rate.gart_copyouts / sec);
             }
             memset(&r200_rate, 0, sizeof(r200_rate));
             r200_rate.since = now;
@@ -3360,6 +3370,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                 if (s->renderer->flush_r200) {
                     s->renderer->flush_r200(s->renderer_opaque);
                 }
+                r200_rate.gart_copyouts++;
                 if (!r300_write_raw_bulk(s, rt_gart_addr,
                                          vram + pkt.rt_gpu_addr, rt_full_len)) {
                     r300_warn_once("GART/AGP colour buffer copy-out failed "
