@@ -63,3 +63,8 @@ jobs:
 
       - name: tests/audio
         run: sh tests/audio/run.sh
+
+      - name: tests/ppc-vmx (AltiVec on NEON; --diff runs it with host ops on and off)
+        run: |
+          brew install llvm lld </dev/null
+          python3 tests/ppc-vmx/run.py --diff build/qemu-system-ppc
