@@ -30,6 +30,7 @@
 #include <math.h>
 #include <sched.h>
 #include "qemu/log.h"
+#include "qemu/error-report.h"
 #include "qemu/host-utils.h"
 #include "qemu/module.h"
 #include "qemu/units.h"
@@ -9555,17 +9556,12 @@ static void ppc_mac_gpu_dump_ib_lost_diag(PPCMacGPUState *s,
  * The IB address may be in VRAM or in the GART aperture (system RAM).
  * We try GART first; if that fails, fall back to VRAM.
  *
- * qemu#1: a nested IB is a fixed, complete buffer fetched fresh in this one
- * call -- unlike the ring, there is no later call that "resumes" from where
- * process_pm4 left off if it defers an incomplete trailing packet here (its
- * return value used to be discarded outright). Track the last IB dispatched
- * (whether or not it deferred) so a deferral inside THIS IB can be logged
- * against where the previous IB ended, and so the IB that runs right after
- * a deferral can be logged against where the deferring IB ended -- together
- * that shows whether consecutive IBs are contiguous (the kext growing one
- * logical buffer across BUFSZ writes -- carry the tail across IBs) or not
- * (a size-decode bug scoped to the deferring IB alone). Diagnostic only --
- * does not change what gets executed.
+ * Each BUFSZ write supplies a finite stream, unlike a growing ring window.
+ * An incomplete tail is truncated by this emulator; it is not queued for a
+ * subsequent IB. Keep execution inside the submitted dword count.
+ *
+ * Adjacent addresses alone do not establish packet continuation. Record
+ * the preceding IB for diagnosis without changing packet framing.
  */
 static struct {
     bool valid, deferred;
@@ -9582,11 +9578,11 @@ static void ppc_mac_gpu_execute_ib(PPCMacGPUState *s,
             next_budget--;
             qemu_log("ppc-mac-gpu: IB after deferred tail: this base=%08x "
                      "size=%u, deferring IB was base=%08x size=%u "
-                     "consumed=%u end=%08x gap=%d\n",
+                     "consumed=%u end=%08x gap=%" PRId64 "\n",
                      ib_base, ib_size_dw, last_ib.base, last_ib.size_dw,
                      last_ib.consumed, last_ib.base + last_ib.size_dw * 4,
-                     (int)ib_base - (int)(last_ib.base +
-                                           last_ib.size_dw * 4));
+                     (int64_t)ib_base - (int64_t)(last_ib.base +
+                                                   last_ib.size_dw * 4));
         }
     }
 
@@ -9627,11 +9623,53 @@ static void ppc_mac_gpu_execute_ib(PPCMacGPUState *s,
         }
     }
 
-    s->regs.stall_ib_done++;
-    s->regs.stall_ib_dwords += ib_size_dw;
+    /*
+     * qemu#1 (reopened): discriminating test for the manager's off-by-32-
+     * bytes read-window hypothesis. If the IB fetch window sits 8 dwords
+     * too low, most IBs would start with what's actually the tail of
+     * whatever precedes them in memory -- usually the previous IB's type-2
+     * NOP padding (0x80000000), so this should show mostly NOPs at [0] if
+     * the hypothesis holds, real headers if it doesn't. Logged for every
+     * IB (not just deferred ones), unconditionally, so the pattern across
+     * a normal run's whole IB population is visible, not just the ones
+     * that already went wrong.
+     */
+    {
+        /*
+         * The boot-time ring fills with thousands of pure-NOP 8-dword
+         * micro-IBs at regularly spaced 0x2000-byte addresses -- harmless
+         * housekeeping, not what we're testing for, and it burns the whole
+         * budget before any real gameplay traffic gets a turn. Skip logging
+         * those so the budget survives into the traffic that actually
+         * exercises this.
+         */
+        static unsigned first8_budget = 2000;
+        uint32_t n = ib_size_dw < 8 ? ib_size_dw : 8;
+        uint32_t v[8] = { 0 };
+        for (uint32_t d = 0; d < n; d++) {
+            v[d] = ib_data[d];
+        }
+        bool all_nop = (n == 8);
+        for (uint32_t d = 0; all_nop && d < 8; d++) {
+            all_nop = (v[d] == 0x80000000);
+        }
+        if (first8_budget && !all_nop) {
+            first8_budget--;
+            qemu_log("ppc-mac-gpu: IB first %u dwords (base=%08x size=%u): "
+                     "%08x %08x %08x %08x %08x %08x %08x %08x\n",
+                     n, ib_base, ib_size_dw,
+                     v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+        }
+    }
+
     uint32_t consumed = ppc_mac_gpu_process_pm4(s, ib_data, ib_size_dw);
+    s->regs.stall_ib_dwords += consumed;
+    if (consumed == ib_size_dw) {
+        s->regs.stall_ib_done++;
+    }
 
     if (consumed < ib_size_dw) {
+        s->regs.stall_ib_lost++;
         static unsigned budget = 20;
         if (budget) {
             budget--;
@@ -9640,17 +9678,17 @@ static void ppc_mac_gpu_execute_ib(PPCMacGPUState *s,
             bool have_after = ppc_mac_gpu_read_dwords(
                 s, ib_base + ib_size_dw * 4, after, 8, &after_read);
 
-            qemu_log("ppc-mac-gpu: IB deferred tail base=%08x size=%u "
+            qemu_log("ppc-mac-gpu: IB truncated tail base=%08x size=%u "
                      "consumed=%u prev_ib=%s prev_base=%08x prev_size=%u "
-                     "prev_consumed=%u prev_end=%08x gap=%d\n",
+                     "prev_consumed=%u prev_end=%08x gap=%" PRId64 "\n",
                      ib_base, ib_size_dw, consumed,
                      last_ib.valid ? "yes" : "no", last_ib.base,
                      last_ib.size_dw, last_ib.consumed,
                      last_ib.base + last_ib.size_dw * 4,
                      last_ib.valid
-                         ? (int)ib_base - (int)(last_ib.base +
-                                                 last_ib.size_dw * 4)
-                         : 0);
+                         ? (int64_t)ib_base - (int64_t)(last_ib.base +
+                                                         last_ib.size_dw * 4)
+                         : (int64_t)0);
             if (have_after) {
                 qemu_log("ppc-mac-gpu: IB deferred tail: 8 dwords after "
                          "this IB's end (base=%08x): "
@@ -9687,6 +9725,11 @@ static void ppc_mac_gpu_execute_ib(PPCMacGPUState *s,
  *   - RPTR and WPTR are in DWord units
  *   - Ring wraps at (ring_size_dw - 1)
  */
+/* Bound each process_pm4() pass over ring data so one WPTR update covering
+ * a large batch (legal ring sizes run well past this) can't turn into an
+ * unbounded parse; see the chunk loop below. */
+#define RING_BATCH_MAX_DW 65536
+
 /*
  * Advances CP_RB_RPTR by exactly the dwords actually consumed (in complete
  * packets), never by the full (new_wptr - old_rptr) span the guest asked
@@ -9715,27 +9758,29 @@ static void ppc_mac_gpu_process_ring_buffer(PPCMacGPUState *s,
         return;
     }
 
-    /* Safety limit — don't process excessively large batches */
-    if (count > 65536) {
-        gpu_debug_log("RING: skipping oversized batch (%u dw)", count);
-        return;
+    /* Prepend any packet staged out of a prior call (see ring_stage_dw's
+     * declaration) so it is reassembled with this call's freshly published
+     * dwords before dispatch. */
+    uint32_t staged_len = s->ring_stage_len;
+    uint32_t total = staged_len + count;
+    uint32_t *data = g_malloc(total * 4);
+    if (staged_len) {
+        memcpy(data, s->ring_stage_dw, staged_len * 4);
     }
 
     /* Read ring buffer data via GART translation.
      * The ring buffer base (CP_RB_BASE) is an AGP address that needs
-     * GART translation to access system RAM. */
-    uint32_t *rb_data = g_malloc(count * 4);
-
-    /* In runs up to the ring's end, where it wraps to its base. */
+     * GART translation to access system RAM. In runs up to the ring's
+     * end, where it wraps to its base. */
     for (uint32_t i = 0; i < count; ) {
         uint32_t offset_dw = (old_rptr + i) & ring_mask;
         uint32_t run = MIN(count - i, ring_mask + 1 - offset_dw);
 
         PPCMacGPUCPReadTrace read;
         if (!ppc_mac_gpu_read_dwords(s, s->regs.cp_rb_base + offset_dw * 4,
-                                     rb_data + i, run, &read)) {
+                                     data + staged_len + i, run, &read)) {
             ppc_mac_gpu_dump_ib_lost_diag(s, &read, true);
-            g_free(rb_data);
+            g_free(data);
             return;
         }
         ppc_mac_gpu_cp_read_good(s, 1, &read);
@@ -9747,11 +9792,56 @@ static void ppc_mac_gpu_process_ring_buffer(PPCMacGPUState *s,
 
     const char *saved_submission = cp_submission;
     cp_submission = "ring";
-    uint32_t consumed = ppc_mac_gpu_process_pm4(s, rb_data, count);
-    cp_submission = saved_submission;
-    g_free(rb_data);
 
-    if (consumed < count) {
+    /* qemu#1: process in bounded chunks so a large batch can't stall the
+     * ring the way an outright reject of the whole batch used to (RPTR
+     * never advanced, so the next identical WPTR write hit the same
+     * rejection again). Only a defer with zero progress ends the loop: a
+     * packet split by a synthetic chunk boundary still makes progress
+     * within that chunk (everything before it dispatched normally) and
+     * the next iteration starts a fresh, full-width chunk right at it --
+     * every packet fits within RING_BATCH_MAX_DW (a PM4 header caps one
+     * packet at 16385 dwords), so the only way to make zero progress is a
+     * packet that does not fit in what remains of `total` at all, a
+     * genuine wait-for-more-data case.
+     */
+    uint32_t consumed_total = 0;
+    while (consumed_total < total) {
+        uint32_t chunk = MIN(total - consumed_total,
+                              (uint32_t)RING_BATCH_MAX_DW);
+        uint32_t consumed = ppc_mac_gpu_process_pm4(s, data + consumed_total,
+                                                     chunk);
+        consumed_total += consumed;
+        if (consumed == 0) {
+            break;
+        }
+    }
+    cp_submission = saved_submission;
+
+    uint32_t leftover = total - consumed_total;
+    uint32_t fresh_consumed = consumed_total > staged_len
+                                   ? consumed_total - staged_len : 0;
+
+    /*
+     * A packet already being staged entering this call (staged_len > 0)
+     * must stay staged for as long as it remains incomplete: its already-
+     * published dwords were freed from the ring on a prior call, and
+     * there is no "put it back" once that has happened. A packet staged
+     * for the first time this call is the genuine-deadlock case: nothing
+     * completed (fresh_consumed == 0) and this call alone published the
+     * ring's entire usable capacity (ring_size_dw - 1, the one-slot-
+     * reserved convention real CP ring producers use, e.g. Linux's
+     * radeon_ring.c), so the guest cannot publish the remainder without
+     * WPTR overtaking RPTR. Anything else is an ordinary deferral: the
+     * ring still has room for the rest to arrive with a later WPTR
+     * write, so RPTR is left exactly where the pre-existing (tested)
+     * behaviour puts it and nothing is staged.
+     */
+    bool keep_staging = leftover > 0 &&
+                         (staged_len > 0 ||
+                          (fresh_consumed == 0 && count >= ring_size_dw - 1));
+
+    if (leftover > 0 && !keep_staging) {
         /* The tail of this WPTR update is an incomplete packet: proof (for
          * a live qemu#1 run) that the guest really does bump WPTR
          * mid-packet -- the precondition the old unconditional-ack bug
@@ -9763,14 +9853,34 @@ static void ppc_mac_gpu_process_ring_buffer(PPCMacGPUState *s,
             ring_deferred_budget--;
             qemu_log("ppc-mac-gpu: PM4 deferred at ring boundary "
                      "rptr=%u wptr=%u count=%u consumed=%u total=%"PRIu64"\n",
-                     old_rptr, new_wptr, count, consumed,
+                     old_rptr, new_wptr, count, fresh_consumed,
                      ring_deferred_count);
         }
+        s->ring_stage_len = 0;
+    } else if (keep_staging) {
+        /* leftover can never exceed ring_stage_dw's capacity: it is
+         * always the already-available prefix of exactly one incomplete
+         * packet, capped by the PM4 header format itself (16385 dwords,
+         * see above). */
+        assert(leftover <= ARRAY_SIZE(s->ring_stage_dw));
+        memcpy(s->ring_stage_dw, data + consumed_total, leftover * 4);
+        s->ring_stage_len = leftover;
+        fresh_consumed = count; /* All of it safely copied out and staged. */
+        static uint64_t ring_stage_count;
+        ring_stage_count++;
+        qemu_log("ppc-mac-gpu: PM4 ring packet exceeds ring capacity, "
+                 "staged %u dwords in device rptr=%u wptr=%u count=%u "
+                 "ring_size=%u total=%"PRIu64"\n", leftover, old_rptr,
+                 new_wptr, count, ring_size_dw, ring_stage_count);
+    } else {
+        s->ring_stage_len = 0; /* Fully consumed: drop any old stage. */
     }
 
-    s->regs.cp_rb_rptr = (old_rptr + consumed) & ring_mask;
-    s->regs.stall_ring_dwords += consumed;
-    r200_traffic.ring_dwords += consumed;
+    g_free(data);
+
+    s->regs.cp_rb_rptr = (old_rptr + fresh_consumed) & ring_mask;
+    s->regs.stall_ring_dwords += fresh_consumed;
+    r200_traffic.ring_dwords += fresh_consumed;
 }
 
 /* The last command packets pushed in by hand, for the stall report. */
@@ -11161,6 +11271,13 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     case R200_RBBM_SOFT_RESET:
         /* Acknowledge the reset request, but don't actually reset much */
         trace_ppc_mac_gpu_soft_reset(val);
+        if (val & (1 << 0)) { /* SOFT_RESET_CP */
+            /* qemu#1: the CP itself is being reset -- a staged partial
+             * packet (see ring_stage_dw's declaration) belongs to a
+             * command stream the guest is explicitly abandoning here,
+             * same as a CP_RB_BASE/CNTL/RPTR reinit. */
+            s->ring_stage_len = 0;
+        }
         break;
 
     /* Surface */
@@ -11481,6 +11598,14 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
 
     /* CP - command processor */
     case R200_CP_RB_BASE:
+        /* qemu#1: the guest only (re)writes BASE/CNTL/RPTR when setting up
+         * or reinitializing the ring, never during ordinary operation --
+         * RPTR is otherwise CP-maintained. A staged partial packet (see
+         * ring_stage_dw's declaration) is meaningless once that happens:
+         * it was read relative to the OLD base/position, so drop it
+         * rather than prepend stale bytes to the reinitialized ring's
+         * first real traffic. */
+        s->ring_stage_len = 0;
         s->regs.cp_rb_base = val;
         gpu_debug_log("CP_SETUP RB_BASE=0x%08x", (uint32_t)val);
         trace_ppc_mac_gpu_cp_ring_setup(val, s->regs.cp_rb_cntl);
@@ -11490,10 +11615,21 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         ppc_mac_gpu_rptr_writeback(s);
         break;
     case R200_CP_RB_CNTL:
+        /* qemu#1: only a ring-SIZE change (bits[5:0], rb_bufsz -- the only
+         * part of this register ppc_mac_gpu_process_ring_buffer reads)
+         * actually reinitializes the ring; the rest (RB_NO_UPDATE,
+         * RB_BLKSZ, MAX_FETCH, ...) are writeback/fetch policy that a
+         * driver can legitimately change mid-stream without abandoning a
+         * packet already staged. See RB_BASE above for why a real
+         * reinit clears the stage. */
+        if (((uint32_t)val & 0x3F) != (s->regs.cp_rb_cntl & 0x3F)) {
+            s->ring_stage_len = 0;
+        }
         s->regs.cp_rb_cntl = val;
         gpu_debug_log("CP_SETUP RB_CNTL=0x%08x (log2size=%u)", (uint32_t)val, (uint32_t)val & 0x3f);
         break;
     case R200_CP_RB_RPTR:
+        s->ring_stage_len = 0; /* qemu#1: ring reinit, see RB_BASE above */
         s->regs.cp_rb_rptr = val;
         ppc_mac_gpu_rptr_writeback(s);
         gpu_debug_log("CP_RING RPTR <- %u", (uint32_t)val);
@@ -11523,10 +11659,31 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         s->regs.cp_csq_stat_counter++;
         break;
     }
-    case R200_CP_ME_CNTL:
+    case R200_CP_ME_CNTL: {
+        /*
+         * qemu#1: WPTR writes made while ME_HALT was set are stored
+         * (cp_rb_wptr advances) but never dispatched -- the WPTR handler
+         * above only calls ppc_mac_gpu_process_ring_buffer() when the
+         * microengine is running. Nothing previously resumed that
+         * backlog on the halt->run transition, so it sat in the ring
+         * forever unless the guest happened to write WPTR again after
+         * unhalting (which it has no reason to do if it was already
+         * waiting for the halted work to finish). Drain [RPTR, WPTR)
+         * here exactly as a WPTR write would, the moment ME_HALT clears.
+         */
+        bool was_halted = s->regs.cp_me_cntl & (1 << 28);
+        bool now_halted = val & (1 << 28);
         s->regs.cp_me_cntl = val;
         gpu_debug_log("CP_SETUP ME_CNTL=0x%08x (ME_start=%d)", (uint32_t)val, !((uint32_t)val & 0x10000000));
+        if (was_halted && !now_halted &&
+            s->regs.cp_rb_wptr != s->regs.cp_rb_rptr) {
+            uint32_t old_rptr = s->regs.cp_rb_rptr;
+            ppc_mac_gpu_process_ring_buffer(s, old_rptr, s->regs.cp_rb_wptr);
+            ppc_mac_gpu_rptr_writeback(s);
+            s->regs.cp_csq_stat_counter++;
+        }
         break;
+    }
     case R200_CP_IB_BASE:
         s->regs.cp_ib_base = val;
         gpu_debug_log("CP_IB BASE <- 0x%08x", (uint32_t)val);
@@ -12248,6 +12405,7 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
     s->reset_gen++;
     memset(&s->regs, 0, sizeof(s->regs));
     s->hwc_w = s->hwc_h = s->hwc_idx = 0;
+    s->ring_stage_len = 0; /* qemu#1: don't resume a stale partial packet */
     s->regs.regs_3d[R200_3D_IDX(0x3230)] = 0xFFFFFFFFu;  /* DEPTHCLEARVALUE */
     s->hwc_visible = false;
     if (s->con) {
@@ -12922,8 +13080,61 @@ static int ppc_mac_gpu_post_load(void *opaque, int version_id)
     if (s->con) {
         qemu_console_update_full(s->con);
     }
+
+    /*
+     * qemu#1: a malformed/corrupted snapshot must not be trusted with
+     * ring_stage_len -- the next ring update uses it directly in a
+     * malloc/memcpy size (ppc_mac_gpu_process_ring_buffer). The in-
+     * process invariant (leftover < packet_dw <= 16385, enforced by an
+     * assert at the one place that writes it) only holds for state this
+     * emulator staged itself; migration input gets no such guarantee.
+     */
+    if (s->ring_stage_len > ARRAY_SIZE(s->ring_stage_dw)) {
+        error_report("ppc-mac-gpu: corrupt snapshot: ring_stage_len %u "
+                     "exceeds capacity %zu", s->ring_stage_len,
+                     ARRAY_SIZE(s->ring_stage_dw));
+        return -1;
+    }
+    if (s->ring_stage_len > 0) {
+        uint32_t packet_dw = ppc_mac_gpu_pm4_packet_dw(s->ring_stage_dw[0]);
+        if (s->ring_stage_len >= packet_dw) {
+            error_report("ppc-mac-gpu: corrupt snapshot: ring_stage_len %u "
+                         "is not shorter than its own header's packet "
+                         "length %u", s->ring_stage_len, packet_dw);
+            return -1;
+        }
+    }
     return 0;
 }
+
+/*
+ * qemu#1: a ring packet staged because it outgrew the ring's own usable
+ * capacity -- see ring_stage_dw's declaration. A subsection, not plain
+ * fields on the parent: ring_stage_len is 0 on the overwhelming majority
+ * of snapshots (nothing was mid-deferral at save time), and .needed skips
+ * writing it there, so an old snapshot without this subsection loads
+ * exactly as before -- ring_stage_len stays at its post-reset default of
+ * 0 -- rather than needing a version bump that would invalidate every
+ * snapshot taken before this fix.
+ */
+static bool ppc_mac_gpu_ring_stage_needed(void *opaque)
+{
+    PPCMacGPUState *s = opaque;
+    return s->ring_stage_len != 0;
+}
+
+static const VMStateDescription vmstate_ppc_mac_gpu_ring_stage = {
+    .name = "ppc-mac-gpu/ring_stage",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = ppc_mac_gpu_ring_stage_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(ring_stage_len, PPCMacGPUState),
+        VMSTATE_BUFFER_UNSAFE(ring_stage_dw, PPCMacGPUState, 1,
+                              sizeof(((PPCMacGPUState *)0)->ring_stage_dw)),
+        VMSTATE_END_OF_LIST()
+    }
+};
 
 static const VMStateDescription vmstate_ppc_mac_gpu = {
     .name = "ppc-mac-gpu",
@@ -12980,6 +13191,10 @@ static const VMStateDescription vmstate_ppc_mac_gpu = {
         VMSTATE_BUFFER_UNSAFE(r300_shadow, PPCMacGPUState, 1,
                               sizeof(((PPCMacGPUState *)0)->r300_shadow)),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_ppc_mac_gpu_ring_stage,
+        NULL
     }
 };
 

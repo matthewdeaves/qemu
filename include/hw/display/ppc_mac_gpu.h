@@ -837,6 +837,24 @@ struct PPCMacGPUState {
      */
     uint32_t r300_shadow[0x5000 / 4];
 
+    /*
+     * qemu#1: a ring packet deferred because it exceeds the ring's own
+     * usable capacity (ring_size_dw - 1) is staged here rather than left
+     * on the ring, so RPTR can still advance and free that space -- see
+     * ppc_mac_gpu_process_ring_buffer(). A PM4 header caps a single
+     * packet at 16385 dwords (type 0/3's 14-bit count field), so this
+     * can never need more room than that; ring_stage_len is 0 whenever
+     * nothing is staged. Fixed-size and included in the VMState buffer
+     * pattern already used for r300_shadow/hwc_pix/tiled_surfaces above,
+     * not a separate heap allocation: it must survive device reset (a
+     * guest reboot must not resume a stale partial packet from a prior
+     * boot) and save/restore (the source side has already acknowledged
+     * these dwords as consumed from the ring; losing them on restore
+     * would silently drop real guest commands).
+     */
+    uint32_t ring_stage_dw[16384];
+    uint32_t ring_stage_len;
+
     /* Hardware cursor (patched qemu_vga.ndrv, MMIO BAR + 0xFF00) */
     uint32_t hwc_pix[64 * 64];
     uint32_t hwc_w, hwc_h, hwc_idx;
