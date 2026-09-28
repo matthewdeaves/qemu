@@ -9079,6 +9079,57 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
 }
 
 /*
+ * qemu#1: "IB lost (not in GART or VRAM)" has been seen once flooding the
+ * log after a long steady-state run (5.5M+ draws), guest frozen. Not
+ * reproduced on demand yet, so when it recurs we want the state that made
+ * both ppc_mac_gpu_gart_translate() and ppc_mac_gpu_agp_translate() give up
+ * on THIS address, not just the address itself. Capped per process
+ * lifetime so it adds detail without out-flooding the flood it diagnoses.
+ */
+static void ppc_mac_gpu_dump_ib_lost_diag(PPCMacGPUState *s, uint32_t ib_base)
+{
+    static int budget = 5;
+    if (budget <= 0) {
+        return;
+    }
+    budget--;
+
+    bool aic_on = (s->regs.aic_ctrl & 1) != 0;
+    bool aic_in_range = ib_base >= s->regs.aic_lo_addr &&
+                         ib_base <= s->regs.aic_hi_addr;
+    uint32_t pt_base = (s->r300 && s->r300_aic_pt_base) ? s->r300_aic_pt_base
+                                                          : s->regs.aic_pt_base;
+    uint32_t aic_pte = 0;
+    bool aic_pte_ok = false;
+    if (aic_on && aic_in_range && pt_base) {
+        uint32_t page_idx = (ib_base - s->regs.aic_lo_addr) >> 12;
+        hwaddr pte_addr = (hwaddr)pt_base + page_idx * 4;
+        aic_pte_ok = address_space_read(&address_space_memory, pte_addr,
+                                         MEMTXATTRS_UNSPECIFIED, &aic_pte,
+                                         4) == MEMTX_OK;
+    }
+
+    uint32_t agp_loc = s->regs.mc_agp_location;
+    uint32_t agp_start = (agp_loc & 0xFFFF) << 16;
+    uint32_t agp_end = (((agp_loc >> 16) & 0xFFFF) << 16) | 0xFFFF;
+    bool agp_in_range = agp_loc != 0 && ib_base >= agp_start &&
+                         ib_base <= agp_end;
+
+    qemu_log("ppc-mac-gpu: IB lost diag base=%08x: "
+             "aic_ctrl=%08x(on=%d) aic_lo=%08x aic_hi=%08x in_range=%d "
+             "pt_base=%08x(r300=%d) pte_read_ok=%d pte=%08x | "
+             "mc_agp_location=%08x agp=[%08x,%08x] in_range=%d | "
+             "mc_fb_location=%08x vram_size=%08llx stall_lost=%llu "
+             "stall_done=%llu\n",
+             ib_base, s->regs.aic_ctrl, aic_on, s->regs.aic_lo_addr,
+             s->regs.aic_hi_addr, aic_in_range, pt_base, s->r300,
+             aic_pte_ok, aic_pte, agp_loc, agp_start, agp_end, agp_in_range,
+             s->regs.mc_fb_location, (unsigned long long)s->vram_size,
+             (unsigned long long)s->regs.stall_ib_lost,
+             (unsigned long long)s->regs.stall_ib_done);
+}
+
+/*
  * Execute an Indirect Buffer.
  *
  * The IB address may be in VRAM or in the GART aperture (system RAM).
@@ -9109,6 +9160,7 @@ static void ppc_mac_gpu_execute_ib(PPCMacGPUState *s,
             gpu_debug_log("IB_EXEC: neither GART nor VRAM (base=0x%x)", ib_base);
             qemu_log("ppc-mac-gpu: IB lost (not in GART or VRAM): base=%08x size=%u\n",
                      ib_base, ib_size_dw);
+            ppc_mac_gpu_dump_ib_lost_diag(s, ib_base);
             s->regs.stall_ib_lost++;
             return;
         }
