@@ -9629,6 +9629,46 @@ static void ppc_mac_gpu_execute_ib(PPCMacGPUState *s,
 
     s->regs.stall_ib_done++;
     s->regs.stall_ib_dwords += ib_size_dw;
+
+    /*
+     * qemu#1 (reopened): discriminating test for the manager's off-by-32-
+     * bytes read-window hypothesis. If the IB fetch window sits 8 dwords
+     * too low, most IBs would start with what's actually the tail of
+     * whatever precedes them in memory -- usually the previous IB's type-2
+     * NOP padding (0x80000000), so this should show mostly NOPs at [0] if
+     * the hypothesis holds, real headers if it doesn't. Logged for every
+     * IB (not just deferred ones), unconditionally, so the pattern across
+     * a normal run's whole IB population is visible, not just the ones
+     * that already went wrong.
+     */
+    {
+        /*
+         * The boot-time ring fills with thousands of pure-NOP 8-dword
+         * micro-IBs at regularly spaced 0x2000-byte addresses -- harmless
+         * housekeeping, not what we're testing for, and it burns the whole
+         * budget before any real gameplay traffic gets a turn. Skip logging
+         * those so the budget survives into the traffic that actually
+         * exercises this.
+         */
+        static unsigned first8_budget = 2000;
+        uint32_t n = ib_size_dw < 8 ? ib_size_dw : 8;
+        uint32_t v[8] = { 0 };
+        for (uint32_t d = 0; d < n; d++) {
+            v[d] = ib_data[d];
+        }
+        bool all_nop = (n == 8);
+        for (uint32_t d = 0; all_nop && d < 8; d++) {
+            all_nop = (v[d] == 0x80000000);
+        }
+        if (first8_budget && !all_nop) {
+            first8_budget--;
+            qemu_log("ppc-mac-gpu: IB first %u dwords (base=%08x size=%u): "
+                     "%08x %08x %08x %08x %08x %08x %08x %08x\n",
+                     n, ib_base, ib_size_dw,
+                     v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+        }
+    }
+
     uint32_t consumed = ppc_mac_gpu_process_pm4(s, ib_data, ib_size_dw);
 
     if (consumed < ib_size_dw) {
