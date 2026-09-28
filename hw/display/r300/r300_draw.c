@@ -1215,6 +1215,7 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
     float consts[256][4];
     Build b;
 
+    pkt->diag_draw = st->draws;
     prim = vf & 0xF;
 
     /* Colour buffer */
@@ -1703,4 +1704,204 @@ void r300_draw_free(R300DrawPacket *pkt)
         free(pkt->tex[t].host_data);
         pkt->tex[t].host_data = NULL;
     }
+}
+
+
+/* Deliberately separate from the capped, cheap R300_DRAWLOG. The game/GL
+ * dlight object is not visible here: constants and texels are GPU inputs,
+ * never labelled as the original light's colour or world-space origin. */
+FILE *r300_lightlog(void)
+{
+    static FILE *f;
+    static bool init;
+
+    if (!init) {
+        const char *path = getenv("R300_LIGHTLOG");
+        init = true;
+        if (path && *path) {
+            f = fopen(path, "w");
+            if (!f) {
+                perror("R300_LIGHTLOG");
+            } else {
+                setvbuf(f, NULL, _IOFBF, 65536);
+                fprintf(f, "LIGHTLOG v1 source_dlight_rgb=unavailable "
+                        "source_dlight_origin=unavailable; GPU inputs only\n");
+            }
+        }
+    }
+    return f;
+}
+
+void r300_lightlog_draw(const R300State *st, const R300DrawPacket *pkt)
+{
+    FILE *f = r300_lightlog();
+    static uint32_t last_msl;
+    static uint8_t seen_msl[8192];
+    static uint64_t last_pvs = UINT64_MAX;
+    const R300FSUniforms *u = &pkt->uniforms;
+    unsigned long long draw = pkt->diag_draw;
+
+    if (!f) {
+        return;
+    }
+    fprintf(f, "DRAW D%llu msl=%u verts=%u+%u warn=%x tx_enable=%x "
+            "rt=%08x pitch=%08x outfmt=%08x cblend=%08x ablend=%08x "
+            "chanmask=%x alpha=%x rop=%x blend_rgba=%g,%g,%g,%g "
+            "fog=%x fog_rgba=%g,%g,%g,%g "
+            "pvs_ctrl=%08x pvs_const=%08x vap=%08x\n", draw, pkt->msl_id,
+            pkt->num_verts, pkt->num_line_verts, pkt->warn,
+            r300_reg(st, TX_ENABLE), pkt->rt_gpu_addr,
+            r300_reg(st, RB3D_COLORPITCH0), r300_reg(st, US_OUT_FMT_0),
+            u->cblend, u->ablend, u->chanmask, u->alpha_func, u->rop,
+            u->blend_color[0], u->blend_color[1], u->blend_color[2],
+            u->blend_color[3], u->fog_blend, u->fog_color[0],
+            u->fog_color[1], u->fog_color[2], u->fog_color[3],
+            r300_reg(st, VAP_PVS_CODE_CNTL_0),
+            r300_reg(st, VAP_PVS_CONST_CNTL), r300_reg(st, VAP_CNTL_STATUS));
+    /* Include zero constants: a transition back to zero is evidence too. */
+    for (unsigned i = 0; i < R300_US_NUM_CONSTS; i++) {
+        fprintf(f, "CONST D%llu c%u raw=%06x,%06x,%06x,%06x "
+                "rgba=%g,%g,%g,%g\n", draw, i,
+                r300_reg(st, PFS_PARAM_0_X + 16 * i),
+                r300_reg(st, PFS_PARAM_0_X + 16 * i + 4),
+                r300_reg(st, PFS_PARAM_0_X + 16 * i + 8),
+                r300_reg(st, PFS_PARAM_0_X + 16 * i + 12),
+                u->consts[i][0], u->consts[i][1],
+                u->consts[i][2], u->consts[i][3]);
+    }
+    for (unsigned t = 0; t < R300_NUM_TEX_UNITS; t++) {
+        const R300TexDesc *td = &pkt->tex[t];
+        if (!(r300_reg(st, TX_ENABLE) & (1u << t))) {
+            continue;
+        }
+        fprintf(f, "TEX D%llu t%u bound=%u tx_offset=%08x endian=%u "
+                "format0=%08x format1=%08x format2=%08x fmt=%02x "
+                "addr=%08x source=%s kind=%u size=%ux%u pitch=%u levels=%u "
+                "decode=%u swz=%u,%u,%u,%u flags=%x filter=%08x,%08x "
+                "gen=%u now=%u\n", draw, t, td->bound,
+                r300_reg(st, TX_OFFSET_0 + 4 * t), td->swap,
+                r300_reg(st, TX_FORMAT0_0 + 4 * t),
+                r300_reg(st, TX_FORMAT1_0 + 4 * t),
+                r300_reg(st, TX_FORMAT2_0 + 4 * t), td->format,
+                td->gpu_addr, td->host_data ? "GART" : "VRAM", td->kind,
+                td->width, td->height, td->pitch_bytes, td->levels,
+                u->tex_info[t][1], u->tex_swz[t][0], u->tex_swz[t][1],
+                u->tex_swz[t][2], u->tex_swz[t][3], u->tex_dim[t][3],
+                td->filter0, td->filter1, td->write_gen, td->gen_now);
+    }
+    /* The generated shader contains the actual texture combine, routing,
+     * output swizzles and blend equations. Print each program once. */
+    bool new_msl = pkt->msl_id < sizeof(seen_msl) * 8 ?
+        !(seen_msl[pkt->msl_id / 8] & (1u << (pkt->msl_id % 8))) :
+        pkt->msl_id != last_msl;
+    if (pkt->msl && new_msl) {
+        char *us = r300_us_disasm(st);
+        fprintf(f, "US D%llu id=%u BEGIN\n%s\nUS END\n",
+                draw, pkt->msl_id, us ? us : "disassembly unavailable");
+        free(us);
+        fprintf(f, "MSL D%llu id=%u BEGIN\n%s\nMSL END\n",
+                draw, pkt->msl_id, pkt->msl);
+        last_msl = pkt->msl_id;
+        if (pkt->msl_id < sizeof(seen_msl) * 8) {
+            seen_msl[pkt->msl_id / 8] |= 1u << (pkt->msl_id % 8);
+        }
+    }
+    if (st->pvs_gen != last_pvs) {
+        fprintf(f, "STATE D%llu pvs_gen=%llu BEGIN\n", draw,
+                (unsigned long long)st->pvs_gen);
+        r300_state_dump(st, f);
+        fprintf(f, "STATE END\n");
+        last_pvs = st->pvs_gen;
+    }
+    for (unsigned v = 0; v < pkt->num_verts && v < 3; v++) {
+        const R300Vertex *x = &pkt->verts[v];
+        fprintf(f, "VERT D%llu v%u clip=%g,%g,%g,%g", draw, v,
+                x->pos[0], x->pos[1], x->pos[2], x->pos[3]);
+        for (unsigned k = 0; k < R300_NUM_VARYINGS; k++) {
+            fprintf(f, " v%u=%g,%g,%g,%g", k, x->v[k][0], x->v[k][1],
+                    x->v[k][2], x->v[k][3]);
+        }
+        fprintf(f, "\n");
+    }
+}
+
+/* Compare level-zero RGBA8 bytes independently of the renderer's dirty
+ * generations/cache. Cache collisions explicitly start a new baseline.
+ * No GPU waits: the caller must skip GPU-busy memory. Bounded to 64 MB. */
+void r300_lightlog_texels(const R300DrawPacket *pkt, unsigned unit,
+                          const uint8_t *bytes)
+{
+    static struct {
+        uint32_t addr, width, height, pitch;
+        bool gart;
+        uint8_t *bytes;
+    } prev[64];
+    const R300TexDesc *td = &pkt->tex[unit];
+    FILE *f = r300_lightlog();
+    uint64_t len = (uint64_t)td->pitch_bytes * td->height;
+    unsigned slot = (td->gpu_addr >> 5 ^ td->gpu_addr >> 16) % 64;
+    unsigned long long draw = pkt->diag_draw;
+
+    if (!f) {
+        return;
+    }
+    if (td->kind != R300_TEXK_RGBA8 || td->dim != R300_TEXDIM_2D ||
+        !td->width || !td->height || td->pitch_bytes < (uint64_t)td->width * 4 ||
+        len > td->size_bytes || len > 1024 * 1024) {
+        fprintf(f, "TEXELS D%llu t%u skipped=unsupported-layout-or-size\n",
+                draw, unit);
+        return;
+    }
+    bool baseline = !prev[slot].bytes || prev[slot].addr != td->gpu_addr ||
+        prev[slot].width != td->width || prev[slot].height != td->height ||
+        prev[slot].pitch != td->pitch_bytes ||
+        prev[slot].gart != (td->host_data != NULL);
+    if (baseline) {
+        free(prev[slot].bytes);
+        prev[slot].bytes = malloc(len);
+        if (!prev[slot].bytes) {
+            fprintf(f, "TEXELS D%llu t%u skipped=allocation\n", draw, unit);
+            return;
+        }
+        prev[slot].addr = td->gpu_addr;
+        prev[slot].width = td->width;
+        prev[slot].height = td->height;
+        prev[slot].pitch = td->pitch_bytes;
+        prev[slot].gart = td->host_data != NULL;
+    }
+    uint32_t changed = 0, minx = td->width, miny = td->height, maxx = 0, maxy = 0;
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (unsigned y = 0; y < td->height; y++) {
+        for (unsigned x = 0; x < td->width; x++) {
+            size_t off = (size_t)y * td->pitch_bytes + x * 4;
+            const uint8_t *p = bytes + off, *old = prev[slot].bytes + off;
+            for (unsigned c = 0; c < 4; c++) {
+                hash = (hash ^ p[c]) * UINT64_C(1099511628211);
+            }
+            if (!baseline && !memcmp(p, old, 4)) {
+                continue;
+            }
+            if (x < minx) { minx = x; }
+            if (y < miny) { miny = y; }
+            if (x > maxx) { maxx = x; }
+            if (y > maxy) { maxy = y; }
+            /* Every changed texel, not just the atlas corner: the light
+             * can occupy an arbitrary subrect. Bytes are memory order,
+             * not purported source RGB. Use TEX decode/swz and MSL. */
+            fprintf(f, "PIX D%llu t%u xy=%u,%u old=", draw, unit, x, y);
+            if (baseline) {
+                fprintf(f, "none");
+            } else {
+                fprintf(f, "%02x%02x%02x%02x", old[0], old[1], old[2], old[3]);
+            }
+            fprintf(f, " new=%02x%02x%02x%02x\n", p[0], p[1], p[2], p[3]);
+            changed++;
+        }
+    }
+    fprintf(f, "TEXELS D%llu t%u addr=%08x baseline=%u hash=%016llx "
+            "changed=%u bbox=%u,%u-%u,%u\n", draw, unit, td->gpu_addr,
+            baseline, (unsigned long long)hash, changed,
+            changed ? minx : 0, changed ? miny : 0,
+            changed ? maxx + 1 : 0, changed ? maxy + 1 : 0);
+    memcpy(prev[slot].bytes, bytes, len);
 }

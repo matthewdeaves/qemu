@@ -3262,8 +3262,21 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         if (sync_each < 0) {
             sync_each = getenv("R300_SYNC") != NULL;   /* debug: no batching */
         }
+        FILE *lf = r300_lightlog();
+        if (lf) {
+            fprintf(lf, "TIME D%llu real_us=%lld monotonic_us=%lld\n",
+                    (unsigned long long)pkt.diag_draw,
+                    (long long)g_get_real_time(),
+                    (long long)g_get_monotonic_time());
+        }
+        r300_lightlog_draw(s->r3, &pkt);
         int rr = s->renderer->draw_r300(s->renderer_opaque, vram,
                                         s->vram_alloc_size, &pkt);
+        if (lf) {
+            fprintf(lf, "RESULT D%llu renderer=%d\n",
+                    (unsigned long long)pkt.diag_draw, rr);
+            fflush(lf);
+        }
         if (s->r3_dump && g_r300_arm_rt && pkt.rt_gpu_addr == g_r300_arm_rt) {
             fprintf(s->r3_dump, "   renderer -> %d\n", rr);
         }
@@ -3978,6 +3991,15 @@ static void ppc_mac_gpu_host_data_write(PPCMacGPUState *s, uint32_t val)
 {
     if (!s->host_data_active) {
         return;
+    }
+
+    if (s->r3 && !s->host_data_cur_x && !s->host_data_cur_y &&
+        r300_lightlog()) {
+        fprintf(r300_lightlog(), "UPLOAD afterD%llu path=HOST_DATA "
+                "addr=%08x pitch=%u xy=%u,%u wh=%u,%u bpp=%u first=%08x\n",
+                (unsigned long long)s->r3->draws, s->host_data_offset,
+                s->host_data_pitch, s->host_data_dst_x, s->host_data_dst_y,
+                s->host_data_w, s->host_data_h, s->host_data_bpp, val);
     }
 
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
@@ -8674,6 +8696,20 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                         (dst_yx >> 16) & 0xFFFF, dst_yx & 0xFFFF,
                         (dwh >> 16) & 0x3FFF, dwh & 0x3FFF,
                         body_dw - 4);
+
+                if (s->r3 && r300_lightlog()) {
+                    FILE *lf = r300_lightlog();
+                    fprintf(lf, "UPLOAD afterD%llu path=PM4_HOSTDATA "
+                            "gmc=%08x po=%08x addr=%08x pitch=%u "
+                            "xy=%u,%u wh=%u,%u words=%u first=",
+                            (unsigned long long)s->r3->draws, gmc, po,
+                            dst_offset, dst_pitch, dst_x, dst_y,
+                            blit_w, blit_h, body_dw - 4);
+                    for (unsigned i = 4; i < body_dw && i < 12; i++) {
+                        fprintf(lf, "%08x,", d[i]);
+                    }
+                    fprintf(lf, "\n");
+                }
 
                 /* Path instrumentation for HOSTDATA */
                 g_blit_stats.hostdata_count++;

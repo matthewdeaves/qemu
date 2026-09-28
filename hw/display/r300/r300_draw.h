@@ -168,6 +168,7 @@ typedef struct R300ColorDesc {
 } R300ColorDesc;
 
 typedef struct R300DrawPacket {
+    uint64_t diag_draw;         /* correlation with R300State.draws */
     /* Colour buffer 0 */
     uint32_t rt_gpu_addr;
     uint32_t rt_pitch;          /* pixels */
@@ -298,5 +299,11 @@ uint32_t r300_assemble_prov(unsigned prim, uint32_t n, uint32_t *list,
                             uint32_t *cls, R300Prov *prov);
 
 void r300_draw_free(R300DrawPacket *pkt);
+
+/* Optional, uncapped R300_LIGHTLOG=<file> diagnostics. No renderer waits. */
+FILE *r300_lightlog(void);
+void r300_lightlog_draw(const R300State *st, const R300DrawPacket *pkt);
+void r300_lightlog_texels(const R300DrawPacket *pkt, unsigned unit,
+                          const uint8_t *bytes);
 
 #endif

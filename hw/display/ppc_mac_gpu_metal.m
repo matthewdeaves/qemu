@@ -7446,6 +7446,16 @@ static uint8_t *r300_level_bytes(const R300TexDesc *td, const uint8_t *src,
     }
 }
 
+/* Shares the ordered stream with DRAW/TEX/PIX records. No cache changes. */
+static void r300_lightlog_cache(const R300TexDesc *td, const char *decision)
+{
+    FILE *f = r300_lightlog();
+    if (f) {
+        fprintf(f, "CACHE addr=%08x gen=%u now=%u decision=%s\n",
+                td->gpu_addr, td->write_gen, td->gen_now, decision);
+    }
+}
+
 static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> dev,
                                         uint8_t *vram_ptr, const R300TexDesc *td)
 {
@@ -7474,6 +7484,7 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
      * checked at this write generation and never looked at again.
      */
     if (!td->host_data && metal_range_busy_r200(st, lo, hi, false)) {
+        r300_lightlog_cache(td, "wait-gpu-writer");
         g_r300_stat_tex_hazard_full++;
         metal_flush_r200(st);
     }
@@ -7507,6 +7518,7 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
     if (hit >= 0) {
         if (known && g_r300_tcache[hit].gen >= td->write_gen) {
             g_r300_tcache[hit].used = ++g_r300_tcache_clock;
+            r300_lightlog_cache(td, "hit-generation");
             return g_r300_tcache[hit].tex;
         }
 
@@ -7563,6 +7575,7 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
             if (all_unchanged) {
                 g_r300_tcache[hit].gen = td->write_gen;
                 g_r300_tcache[hit].used = ++g_r300_tcache_clock;
+                r300_lightlog_cache(td, "hit-page-hashes");
                 return g_r300_tcache[hit].tex;
             }
             lru = hit;               /* same texture, new texels */
@@ -7573,6 +7586,7 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
             if (g_r300_tcache[hit].hash == hash) {
                 g_r300_tcache[hit].gen = td->write_gen;
                 g_r300_tcache[hit].used = ++g_r300_tcache_clock;
+                r300_lightlog_cache(td, "hit-chain-hash");
                 return g_r300_tcache[hit].tex;
             }
             lru = hit;                /* same texture, new texels */
@@ -7587,6 +7601,7 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
      * out of many (the per-page recheck above only narrows re-HASHING,
      * never re-uploading) -- ticket step 2's suspected "whole-texture
      * re-upload instead of the sub-rect". */
+    r300_lightlog_cache(td, hit >= 0 ? "reupload-changed" : "upload-miss");
     g_r300_stat_tex_full_upload++;
     g_r300_stat_tex_full_upload_bytes += td->size_bytes;
 
@@ -7901,6 +7916,32 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             }
             uint32_t rowel = u.tex_info[t][1];
             id<MTLTexture> x = r300_texture(st, dev, vram_ptr, vram_size, td, &rowel);
+            FILE *lf = r300_lightlog();
+            if (lf) {
+                const char *path = raw ? "raw" :
+                    td->levels > 1 || td->dim != R300_TEXDIM_2D ||
+                    td->kind == R300_TEXK_CONVERT16 ||
+                    td->kind >= R300_TEXK_DXT1 ? "full-cache" :
+                    td->host_data ? "gart-upload" : "vram-view";
+                bool valid = td->host_data ||
+                    (uint64_t)td->gpu_addr + td->size_bytes <= vram_size;
+                bool busy = valid && !td->host_data &&
+                    metal_range_busy_r200(st, td->gpu_addr,
+                        (uint64_t)td->gpu_addr + td->size_bytes, false);
+                fprintf(lf, "BIND D%llu t%d addr=%08x path=%s ok=%u "
+                        "metal_format=%lu rowel=%u gpu_busy=%u\n",
+                        (unsigned long long)pkt->diag_draw, t, td->gpu_addr,
+                        path, x != nil, (unsigned long)(x ? x.pixelFormat : 0),
+                        rowel, busy);
+                if (valid && !busy) {
+                    r300_lightlog_texels(pkt, t, td->host_data ?
+                                        td->host_data : vram_ptr + td->gpu_addr);
+                } else {
+                    fprintf(lf, "TEXELS D%llu t%d skipped=%s\n",
+                            (unsigned long long)pkt->diag_draw, t,
+                            busy ? "gpu-busy" : "out-of-range");
+                }
+            }
             if (!x) {
                 u.tex_info[t][0] = 0;
                 continue;

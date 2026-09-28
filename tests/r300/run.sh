@@ -14,7 +14,7 @@ B=${1:-${TMPDIR:-/tmp}/r300-tests}
 mkdir -p "$B"
 R=../../hw/display/r300
 SRC="$R/r300_state.c $R/r300_pvs.c $R/r300_us.c $R/r300_draw.c"
-for t in test_pvs test_us test_draw test_features test_upload test_clear; do
+for t in test_pvs test_us test_draw test_features test_upload test_clear test_lightlog; do
     cc -O1 -Wall -Wno-unused-function -o "$B/$t" $t.c $SRC -lm
 done
 clang -fobjc-arc -framework Metal -framework Foundation mslcheck.m -o "$B/mslcheck"
@@ -27,6 +27,8 @@ clang -O1 -framework Metal -framework Foundation test_fence.m -o "$B/test_fence"
 "$B/test_draw"
 "$B/test_upload"
 "$B/test_clear"
+"$B/test_lightlog"
+"$B/test_lightlog" "$B/lightlog.txt"
 "$B/test_us" > "$B/qe.metal"
 "$B/mslcheck" "$B/qe.metal"
 "$B/test_features"
