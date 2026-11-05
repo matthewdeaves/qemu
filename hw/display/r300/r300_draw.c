@@ -816,7 +816,11 @@ static void viewport_xform(const R300State *st, const R300DrawPacket *pkt,
     if (!((vte >> 8) & 1)) {
         /* Perspective divide by the VTE: stay linear in clip space so Metal
          * clips and interpolates exactly as the card would. */
-        float w = c[3];
+        /*
+         * VTX_W0_FMT clear: the vertex does not supply W. Panther's
+         * XY-only MSAA resolve leaves the PSC's W component unwritten.
+         */
+        float w = (vte & (1u << 10)) ? c[3] : 1.0f;
         p[0] = (2.0f * vp[0] / W) * c[0] + (2.0f * vp[1] / W - 1.0f) * w;
         p[1] = -(2.0f * vp[2] / H) * c[1] + (1.0f - 2.0f * vp[3] / H) * w;
         p[2] = vp[4] * c[2] + vp[5] * w;
@@ -1231,6 +1235,9 @@ static void gpu_vs_emit_post(R300Sb *sb, const R300State *st, const Layout *lay,
     static const char comp[] = "xyzw";
 
     r300_sb_printf(sb, "    float4 cp = o%d;\n    float4 p;\n", lay->pos);
+    if (!(r300_reg(st, VAP_VTE_CNTL) & (1u << 10))) {
+        r300_sb_printf(sb, "    cp.w = 1.0f;\n");
+    }
     if (persp) {
         r300_sb_printf(sb,
             "    p = float4((2.0f * vs.vp0.x / vs.vp1.z) * cp.x + (2.0f * vs.vp0.y / vs.vp1.z - 1.0f) * cp.w,\n"
@@ -1334,7 +1341,8 @@ static const GpuVs *gpu_vs_get(const R300State *st, const R300PVSProgram *prog,
     key_push(key, &klen, prog->last_inst);
     key_push(key, &klen, prog->max_const);
     key_push(key, &klen, prog->fc_opc);
-    key_push(key, &klen, persp | fog << 1 | fogsel << 2 | clip << 8);
+    key_push(key, &klen, persp | fog << 1 | fogsel << 2 | clip << 8 |
+             ((r300_reg(st, VAP_VTE_CNTL) >> 10) & 1) << 14);
     for (unsigned k = prog->first_inst * 4; k < (prog->last_inst + 1) * 4; k++) {
         key_push(key, &klen, prog->code[k]);
     }

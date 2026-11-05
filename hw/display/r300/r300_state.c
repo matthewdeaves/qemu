@@ -31,7 +31,13 @@ void r300_state_write(R300State *st, uint32_t addr, uint32_t val)
         /* Vector index; data writes then fill 4 dwords per vector. */
         st->pvs_upload_dw = (val & 0x7FF) * 4;
         break;
+    case R300_VAP_PVS_UPLOAD_DATA_LEGACY:
     case R300_VAP_PVS_UPLOAD_DATA:
+        /*
+         * Panther's ATI driver uses the legacy vector-data port at
+         * 0x2204 for both PVS instructions and constants. It shares the
+         * indexed upload cursor with the 0x2208 port used by newer guests.
+         */
         if (st->pvs_upload_dw < R300_PVS_MEM_VECS * 4) {
             st->pvs_mem[st->pvs_upload_dw] = val;
         }

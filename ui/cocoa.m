@@ -333,6 +333,11 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
+    /* Keep cursor dimensions tied to the bitmap across view resizes,
+     * without waiting for the guest to upload another cursor image. */
+    if (cursor) {
+        [cursorLayer setBounds:CGRectMake(0, 0, cursor->width, cursor->height)];
+    }
     [cursorLayer setPosition:position];
     [cursorLayer setHidden:!mouseOn];
     [CATransaction commit];
@@ -530,7 +535,12 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 
 - (void) updateBounds
 {
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
     [self setBoundsSize:NSMakeSize(screen.width, screen.height)];
+    /* Resizing does not require a new cursor image from the guest. */
+    [self setMouseX:mouseX y:mouseY on:mouseOn];
+    [CATransaction commit];
 }
 
 #pragma clang diagnostic push
