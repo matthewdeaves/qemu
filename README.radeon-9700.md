@@ -48,6 +48,35 @@ Pro" with Quartz Extreme and Core Image *Supported*. QemuMac's
 `tests/ci/macos-radeon-build.sh` builds this branch, runs the tests above and boots
 the card.
 
+### Panther guests
+
+Mac OS X 10.3.0 can use its existing ATI driver with the Radeon 9700 device.
+The desktop and stock Chess application have been tested on Apple Silicon
+with the Metal backend, without installing replacement guest drivers.
+
+Panther also needs the boot firmware to describe the full PCI memory window.
+The OpenBIOS image used by QemuMac's Radeon configuration advertises only
+256 MB, while the emulated host bridge implements 1 GB. With a 128 MB Radeon,
+the card's register BAR falls outside that advertised range and Panther's
+driver cannot map it.
+
+Prepend this Forth to the existing Radeon `boot-command`, before its card
+properties and `init-program go`, to advertise `0x80000000`–`0xbfffffff`:
+
+```forth
+" /pci@f2000000" find-device
+h# 01000000 encode-int h# 0 encode-int encode+
+h# 0 encode-int encode+ h# f2000000 encode-int encode+
+h# 0 encode-int encode+ h# 00800000 encode-int encode+
+h# 02000000 encode-int encode+ h# 0 encode-int encode+
+h# 80000000 encode-int encode+ h# 80000000 encode-int encode+
+h# 0 encode-int encode+ h# 40000000 encode-int encode+
+" ranges" property device-end
+```
+
+Join the lines with spaces when passing the command through `-prom-env`.
+This is a boot firmware setting; it does not modify the guest filesystem.
+
 ## Moving to a new QEMU release
 
 ```bash

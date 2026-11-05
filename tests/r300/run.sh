@@ -22,7 +22,9 @@ python3 test_2d_packet_headers.py
 python3 test_texview_bounds.py
 R=../../hw/display/r300
 SRC="$R/r300_state.c $R/r300_pvs.c $R/r300_us.c $R/r300_draw.c"
-for t in test_pvs test_us test_draw test_features test_upload test_clear test_lightlog test_vs_build; do
+for t in test_pvs test_us test_draw test_features test_upload test_clear \
+         test_lightlog test_vs_build test_writeback test_state_ports \
+         test_panther_resolve; do
     cc -O1 -Wall -Wno-unused-function -o "$B/$t" $t.c $SRC -lm
 done
 clang -fobjc-arc -framework Metal -framework Foundation mslcheck.m -o "$B/mslcheck"
@@ -37,6 +39,9 @@ env -u R300_CPU_VS "$B/test_vs_build"
 R300_CPU_VS=1 "$B/test_vs_build"
 "$B/test_draw"
 "$B/test_upload"
+"$B/test_writeback"
+"$B/test_state_ports"
+"$B/test_panther_resolve"
 "$B/test_clear"
 "$B/test_lightlog"
 "$B/test_lightlog" "$B/lightlog.txt"

@@ -26,6 +26,7 @@
 #include "r300/r300_draw.h"
 #include "r300/r300_upload.h"
 #include "r300/r300_clear.h"
+#include "radeon_writeback.h"
 #include "ui/poweremu-harmony.h"
 #include <math.h>
 #include <sched.h>
@@ -2065,8 +2066,16 @@ static void ppc_mac_gpu_rptr_writeback(PPCMacGPUState *s)
         return;                       /* nowhere to write, or the guest said not to */
     }
     uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
+    /*
+     * CP_RB_RPTR_ADDR[1:0] selects the writeback byte order. Panther
+     * requests SWAP_32 (2) and reads the copy with a native PPC load.
+     * Ignoring it turns RPTR 0x7f8 into 0xf8070000; the driver sees zero
+     * free slots and stops submitting once the ring first fills.
+     */
     uint32_t wire_val = TRACE_ON("POWEREMU_WB_BE")
-        ? cpu_to_be32(s->regs.cp_rb_rptr) : cpu_to_le32(s->regs.cp_rb_rptr);
+        ? cpu_to_be32(s->regs.cp_rb_rptr)
+        : cpu_to_le32(radeon_rptr_writeback_word(s->regs.cp_rb_rptr,
+                                               s->regs.cp_rb_rptr_addr & 3));
 
     if (!ppc_mac_gpu_gart_translate(s, addr, &phys) &&
         !ppc_mac_gpu_agp_translate(s, addr, &phys)) {

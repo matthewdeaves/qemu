@@ -96,6 +96,15 @@ int main(void)
         again = build(&changed, 13);
         assert(again.vs_id != gpu.vs_id);
         r300_draw_free(&again);
+        /* An omitted W needs a different shader, even with the same PVS. */
+        changed = base;
+        r300_state_write(&changed, 0x20B0,
+                         r300_reg(&changed, 0x20B0) ^ (1u << 10));
+        again = build(&changed, 13);
+        assert(again.vs_id != gpu.vs_id);
+        assert(!!strstr(again.vs_msl, "cp.w = 1.0f;") ==
+               !(r300_reg(&changed, 0x20B0) & (1u << 10)));
+        r300_draw_free(&again);
         puts("GPU packet: 4 inputs / 6 indices; program+state cache and uniform-only reuse PASS");
         fallback("points", 0x4288, 0, 1);
         fallback("lines", 0x4288, 0, 2);

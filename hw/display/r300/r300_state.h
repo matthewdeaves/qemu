@@ -26,6 +26,7 @@
 #define R300_PVS_UCP_START      1024
 
 #define R300_VAP_PVS_VECTOR_INDX_REG    0x2200
+#define R300_VAP_PVS_UPLOAD_DATA_LEGACY 0x2204
 #define R300_VAP_PVS_UPLOAD_DATA        0x2208
 
 typedef struct R300State {
